@@ -19,7 +19,7 @@ struct AppStoreActionButton: View {
             case .updateAvailable:
                 capsuleButton(title: "UPDATE", isPrimary: true)
             case .installed:
-                capsuleButton(title: "OPEN", isPrimary: false)
+                capsuleButton(title: "OPEN", isPrimary: true)
             case .awaitingConfirmation:
                 ProgressView()
                     .progressViewStyle(CircularProgressViewStyle())

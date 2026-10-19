@@ -18,6 +18,7 @@ struct ModApp: Codable, Identifiable, Hashable {
     let name: String
     let bundleIdentifier: String
     let version: String
+    let urlScheme: String
     let sizeBytes: Int64
     let updatedAt: String
     let iconURL: String
@@ -28,6 +29,11 @@ struct ModApp: Codable, Identifiable, Hashable {
     var formattedSize: String {
         ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file)
     }
+}
+
+struct ProgressResponse: Codable {
+    let status: String
+    let progress: Double
 }
 
 enum InstallState: Equatable {

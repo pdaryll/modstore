@@ -7,16 +7,18 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
     static let shared = StoreManager()
     static let bgTaskID = "com.daryll.modstore.refresh"
 
-    // Change this to your server's catalog URL
     @Published var serverBaseURL: String = UserDefaults.standard.string(forKey: "serverBaseURL") ?? "https://store.daryll.site" {
         didSet {
-        UserDefaults.standard.set(serverBaseURL, forKey: "serverBaseURL")
+            UserDefaults.standard.set(serverBaseURL, forKey: "serverBaseURL")
         }
     }
 
+    var cleanBaseURL: String {
+        serverBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+
     var catalogURL: URL {
-        let cleanBase = serverBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        return URL(string: "\(cleanBase)/catalog.json") ?? URL(string: "https://localhost/catalog.json")!
+        URL(string: "\(cleanBaseURL)/catalog.json") ?? URL(string: "https://localhost/catalog.json")!
     }
 
     @Published var apps: [ModApp] = []
@@ -24,12 +26,11 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
     @Published var installStates: [String: InstallState] = [:]
     @Published var modStoreInstallState: InstallState = .installed
 
-    // Navigation & Deep-Linking State
-    @Published var selectedTab: Int = 0 // 0 = Apps, 1 = Settings
+    @Published var selectedTab: Int = 0
     @Published var navigationPath: [ModApp] = []
     private var pendingDeepLinkAppID: String?
 
-    private var downloadTimers: [String: Timer] = [:]
+    private var pollTasks: [String: Task<Void, Never>] = [:]
 
     var currentModStoreVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0"
@@ -49,7 +50,6 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
     }
 
-    // MARK: - Fetch Catalog & Check for Updates
     func fetchCatalog(sendNotifications: Bool = false) async {
         do {
             let (data, _) = try await URLSession.shared.data(from: catalogURL)
@@ -58,7 +58,6 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
             self.modStoreMeta = decoded.modStore
             refreshInstallStates(sendNotifications: sendNotifications)
 
-            // Resolve pending notification deep link if opened from cold start
             if let pendingID = pendingDeepLinkAppID,
                let targetApp = apps.first(where: { $0.id == pendingID }) {
                 pendingDeepLinkAppID = nil
@@ -71,7 +70,6 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
     }
 
     func refreshInstallStates(sendNotifications: Bool = false) {
-        // 1. Check each catalog app
         for app in apps {
             if case .downloading = installStates[app.id] { continue }
             if case .awaitingConfirmation = installStates[app.id] { continue }
@@ -89,7 +87,6 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
             }
         }
 
-        // 2. Check if ModStore itself has an update
         if let meta = modStoreMeta {
             if isModStoreUpdateAvailable {
                 modStoreInstallState = .updateAvailable
@@ -108,20 +105,28 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
     }
 
     private func evaluateAppState(for app: ModApp) -> InstallState {
-        let baseScheme = URL(string: "myrepo-app-\(app.bundleIdentifier)://")!
-        let versionScheme = URL(string: "myrepo-ver-\(app.bundleIdentifier)-\(app.version)://")!
-
-        let canOpenBase = UIApplication.shared.canOpenURL(baseScheme)
-        let canOpenVer = UIApplication.shared.canOpenURL(versionScheme)
         let savedVersion = UserDefaults.standard.string(forKey: "installed_\(app.id)")
 
-        if canOpenVer || savedVersion == app.version {
+        // Check if the untouched app's native URL scheme (e.g. twitter://) responds on device
+        if !app.urlScheme.isEmpty,
+           let schemeURL = URL(string: "\(app.urlScheme)://") {
+            let isPresentOnDevice = UIApplication.shared.canOpenURL(schemeURL)
+            if !isPresentOnDevice {
+                // App is not installed (or was deleted from the Home Screen)
+                UserDefaults.standard.removeObject(forKey: "installed_\(app.id)")
+                return .notInstalled
+            }
+            if let saved = savedVersion, saved != app.version {
+                return .updateAvailable
+            }
             return .installed
-        } else if canOpenBase || savedVersion != nil {
-            return .updateAvailable
-        } else {
-            return .notInstalled
         }
+
+        // Fallback if IPA has no URL scheme in its Info.plist
+        if let saved = savedVersion {
+            return saved == app.version ? .installed : .updateAvailable
+        }
+        return .notInstalled
     }
 
     // MARK: - Install / Cancel / Open Actions
@@ -138,7 +143,9 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
     }
 
     func startOTAInstall(for app: ModApp) {
+        // 1. Show spinning circle while waiting for the iOS "Install / Cancel" popup
         installStates[app.id] = .awaitingConfirmation
+
         let encodedManifest = app.manifestURL.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? app.manifestURL
         guard let otaURL = URL(string: "itms-services://?action=download-manifest&url=\(encodedManifest)") else {
             installStates[app.id] = evaluateAppState(for: app)
@@ -146,44 +153,83 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
         }
 
         UIApplication.shared.open(otaURL) { [weak self] success in
-            guard let self = self, success else { return }
-            // Transition from spinner to circular progress ring once prompt is confirmed
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-                self.beginProgressTracking(for: app)
+            guard let self = self else { return }
+            if !success {
+                self.installStates[app.id] = self.evaluateAppState(for: app)
+                return
             }
+            self.startPollingServerProgress(for: app)
         }
     }
 
-    private func beginProgressTracking(for app: ModApp) {
-        var progress = 0.05
-        installStates[app.id] = .downloading(progress: progress)
+    private func startPollingServerProgress(for app: ModApp) {
+        pollTasks[app.id]?.cancel()
 
-        downloadTimers[app.id]?.invalidate()
-        downloadTimers[app.id] = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] timer in
-            Task { @MainActor in
-                guard let self = self else { return }
-                progress += 0.08
-                if progress >= 1.0 {
-                    timer.invalidate()
-                    self.downloadTimers.removeValue(forKey: app.id)
-                    UserDefaults.standard.set(app.version, forKey: "installed_\(app.id)")
-                    self.installStates[app.id] = .installed
-                } else {
-                    self.installStates[app.id] = .downloading(progress: progress)
+        pollTasks[app.id] = Task { @MainActor in
+            guard let progressURL = URL(string: "\(cleanBaseURL)/progress/\(app.id)") else { return }
+            var waitingTicks = 0
+
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 350_000_000) // Poll every 0.35s
+                guard !Task.isCancelled else { break }
+
+                do {
+                    let (data, _) = try await URLSession.shared.data(from: progressURL)
+                    let resp = try JSONDecoder().decode(ProgressResponse.self, from: data)
+
+                    switch resp.status {
+                    case "waiting", "idle":
+                        // Still on the iOS system popup; keep spinning circle
+                        waitingTicks += 1
+                        installStates[app.id] = .awaitingConfirmation
+                        // If user tapped "Cancel" on the iOS popup, the app returns to .active and download never starts
+                        if waitingTicks > 8 && UIApplication.shared.applicationState == .active {
+                            installStates[app.id] = evaluateAppState(for: app)
+                            return
+                        }
+
+                    case "downloading":
+                        // User tapped "Install" on the iOS popup; show circular progress ring with stop square
+                        waitingTicks = 0
+                        installStates[app.id] = .downloading(progress: max(0.05, resp.progress))
+
+                    case "completed":
+                        installStates[app.id] = .downloading(progress: 1.0)
+                        // Wait ~3s for iOS installd to finish unpacking and verifying the signed IPA
+                        try? await Task.sleep(nanoseconds: 3_000_000_000)
+                        UserDefaults.standard.set(app.version, forKey: "installed_\(app.id)")
+                        installStates[app.id] = .installed
+                        return
+
+                    case "cancelled":
+                        installStates[app.id] = evaluateAppState(for: app)
+                        return
+
+                    default:
+                        break
+                    }
+                } catch {
+                    // Ignore transient network hiccups while polling
                 }
             }
         }
     }
 
     func cancelDownload(for app: ModApp) {
-        downloadTimers[app.id]?.invalidate()
-        downloadTimers.removeValue(forKey: app.id)
-        // Notify server to drop stream if using session ID tracking
+        pollTasks[app.id]?.cancel()
+        pollTasks.removeValue(forKey: app.id)
         installStates[app.id] = evaluateAppState(for: app)
+
+        if let cancelURL = URL(string: "\(cleanBaseURL)/cancel/\(app.id)") {
+            Task {
+                _ = try? await URLSession.shared.data(from: cancelURL)
+            }
+        }
     }
 
     func openApp(_ app: ModApp) {
-        guard let url = URL(string: "myrepo-app-\(app.bundleIdentifier)://") else { return }
+        guard !app.urlScheme.isEmpty,
+              let url = URL(string: "\(app.urlScheme)://") else { return }
         UIApplication.shared.open(url)
     }
 
@@ -225,10 +271,8 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
 
         Task { @MainActor in
             if target == "modstore_update" {
-                // Open Settings / About tab directly
                 self.selectedTab = 1
             } else if target == "app_detail", let appID = appID {
-                // Open the Apps tab and push the specific App Detail Page
                 self.selectedTab = 0
                 if let matchingApp = self.apps.first(where: { $0.id == appID }) {
                     self.navigationPath = [matchingApp]
@@ -240,10 +284,9 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
         completionHandler()
     }
 
-    // MARK: - Background App Refresh
     func scheduleBackgroundRefresh() {
         let request = BGAppRefreshTaskRequest(identifier: Self.bgTaskID)
-        request.earliestBeginDate = Date(timeIntervalSinceNow: 30 * 60) // Check every ~30 mins
+        request.earliestBeginDate = Date(timeIntervalSinceNow: 30 * 60)
         try? BGTaskScheduler.shared.submit(request)
     }
 }
