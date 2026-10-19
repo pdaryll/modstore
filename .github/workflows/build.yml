@@ -55,7 +55,7 @@ jobs:
           rm -rf "$HOME/Library/Caches/Homebrew"
 
           df -h
-          
+
       - name: Generate Xcode Project & Compile Unsigned App
         run: |
           brew install xcodegen zsign
@@ -116,6 +116,32 @@ jobs:
       #           -o "$WORK_DIR/ModStore-Signed.ipa" \
       #           "$WORK_DIR/Payload/ModStore.app"
       
+      - name: Nuke Unused SDKs and Toolchains
+        run: |
+          echo "=== Free Space Before Deep Clean ==="
+          df -h
+
+          # Remove Android SDK if present (~8GB)
+          sudo rm -rf /usr/local/lib/android
+          
+          # Remove large .NET / Mono SDKs if present (~2-4GB)
+          sudo rm -rf /usr/local/share/dotnet
+          
+          # Remove older or alternate Xcode versions if multiple exist
+          sudo rm -rf /Applications/Xcode_*.app
+          
+          # Clean up Homebrew cache entirely
+          brew uninstall --force --ignore-dependencies $(brew list) || true
+          rm -rf ~/Library/Caches/Homebrew/*
+          
+          echo "=== Free Space After Deep Clean ==="
+          df -h
+
+      - name: Maximize macOS Runner Space
+        uses: justinthelaw/maximize-github-runner-space@v0.12.3
+        with:
+          skip-components: ""
+
       - name: Sign ModStore IPA with RustSign Certificate
         env:
           P12_BASE64: ${{ secrets.RUSTSIGN_P12_BASE64 }}
