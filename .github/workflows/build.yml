@@ -1,190 +1,60 @@
-name: Build & Sign ModStore
+name: Build ModStore Unsigned IPA
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: macos-latest
+
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      # - name: Free runner disk space
-      #   run: |
-      #     set -euxo pipefail
-      #     df -h
-
-
-      #     # Remove large preinstalled SDKs and simulator data that are not
-      #     # needed for an iPhoneOS device build.
-      #     sudo rm -rf /Applications/Xcode_*.app/Contents/Developer/Platforms \
-      #       2>/dev/null || true
-
-      #     rm -rf "$HOME/Library/Developer/Xcode/DerivedData"
-      #     rm -rf "$HOME/Library/Caches/Homebrew"
-      #     rm -rf "$HOME/Library/Developer/Xcode/iOS DeviceSupport"
-      #     rm -rf "$HOME/Library/Developer/CoreSimulator/Caches"
-      #     xcrun simctl delete all || true
-
-      #     # Remove unused Homebrew downloads and caches.
-      #     brew cleanup -s || true
-      #     rm -rf "$HOME/Library/Caches/Homebrew"
-          
-      #     df -h
-
-      - name: Free runner disk space
+      - name: Optional disk cleanup
         run: |
-          set -euxo pipefail
-
-          df -h
-
+          set -euo pipefail
           rm -rf "$HOME/Library/Developer/Xcode/DerivedData"
-          rm -rf "$HOME/Library/Caches/Homebrew"
           rm -rf "$HOME/Library/Developer/Xcode/iOS DeviceSupport"
-          rm -rf "$HOME/Library/Developer/CoreSimulator/Caches"
+          xcrun simctl delete unavailable || true
 
-          xcrun simctl delete all || true
-          brew cleanup -s || true
-
-          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* \
-            2>/dev/null || true
-
-          rm -rf "$HOME/Library/Caches/Homebrew"
-
-          df -h
-
-      - name: Generate Xcode Project & Compile Unsigned App
+      - name: Generate Xcode project
         run: |
-          brew install xcodegen zsign
-          brew cleanup -s || true
-          rm -rf "$HOME/Library/Caches/Homebrew"
-          df -h
+          set -euo pipefail
+          brew install xcodegen
           xcodegen generate
-          xcodebuild -project ModStore.xcodeproj \
-            -scheme ModStore \
-            -configuration Release \
-            -sdk iphoneos \
-            -derivedDataPath build \
+
+      - name: Build ModStore (Release, unsigned)
+        run: |
+          set -euo pipefail
+          xcodebuild -project "ModStore.xcodeproj" \
+            -scheme "ModStore" \
+            -configuration "Release" \
+            -sdk "iphoneos" \
+            -derivedDataPath "build" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY=""
 
-      - name: Check disk usage before signing
-        run: |
-          df -h
-          du -sh "$RUNNER_TEMP"/* 2>/dev/null | sort -h | tail -20 || true
-          du -sh "$HOME/Library"/* 2>/dev/null | sort -h | tail -20 || true
-      
-      # - name: Sign ModStore IPA with RustSign Certificate
-      #   env:
-      #     P12_BASE64: ${{ secrets.RUSTSIGN_P12_BASE64 }}
-      #     PROV_BASE64: ${{ secrets.RUSTSIGN_PROV_BASE64 }}
-      #     P12_PASSWORD: ${{ secrets.RUSTSIGN_PASSWORD }}
-      #   run: |
-      #     set -euo pipefail
-
-      #     echo "$P12_BASE64" | base64 --decode > cert.p12
-      #     echo "$PROV_BASE64" | base64 --decode > cert.mobileprovision
-
-      #     WORK_DIR="$RUNNER_TEMP/modstore"
-      #     rm -rf "$WORK_DIR"
-      #     mkdir -p "$WORK_DIR/Payload"
-      #     cp -R build/Build/Products/Release-iphoneos/ModStore.app \
-      #       "$WORK_DIR/Payload/"
-
-      #     # The compiled app is now safe in RUNNER_TEMP. Remove Xcode's
-      #     # intermediate files before zsign creates the IPA.
-      #     rm -rf build
-      #     rm -rf "$HOME/Library/Developer/Xcode/DerivedData"
-      #     rm -rf "$HOME/Library/Caches/Homebrew"
-          
-      #     # Remove temporary signing inputs after they have been loaded.
-      #     # rm -f cert.p12 cert.mobileprovision
-
-      #     echo "Disk usage before zsign:"
-      #     df -h
-      #     du -sh "$RUNNER_TEMP"/* 2>/dev/null || true
-          
-      #     df -h
-
-      #     zsign -k cert.p12 \
-      #           -p "$P12_PASSWORD" \
-      #           -m cert.mobileprovision \
-      #           -o "$WORK_DIR/ModStore-Signed.ipa" \
-      #           "$WORK_DIR/Payload/ModStore.app"
-      
-      - name: Nuke Unused SDKs and Toolchains
-        run: |
-          echo "=== Free Space Before Deep Clean ==="
-          df -h
-
-          # Remove Android SDK if present (~8GB)
-          sudo rm -rf /usr/local/lib/android
-          
-          # Remove large .NET / Mono SDKs if present (~2-4GB)
-          sudo rm -rf /usr/local/share/dotnet
-          
-          # Remove older or alternate Xcode versions if multiple exist
-          sudo rm -rf /Applications/Xcode_*.app
-          
-          # Clean up Homebrew cache entirely
-          brew uninstall --force --ignore-dependencies $(brew list) || true
-          rm -rf ~/Library/Caches/Homebrew/*
-          
-          echo "=== Free Space After Deep Clean ==="
-          df -h
-
-      - name: Maximize macOS Runner Space
-        uses: justinthelaw/maximize-github-runner-space@v0.12.3
-        with:
-          skip-components: ""
-
-      - name: Restore signing tools
-        run: |
-          brew install zsign
-          command -v zsign
-
-      - name: Sign ModStore IPA with RustSign Certificate
-        env:
-          P12_BASE64: ${{ secrets.RUSTSIGN_P12_BASE64 }}
-          PROV_BASE64: ${{ secrets.RUSTSIGN_PROV_BASE64 }}
-          P12_PASSWORD: ${{ secrets.RUSTSIGN_PASSWORD }}
+      - name: Package unsigned IPA
         run: |
           set -euo pipefail
+          WORK_DIR="$RUNNER_TEMP/modstore-unsigned"
+          APP_PATH="build/Build/Products/Release-iphoneos/ModStore.app"
 
-          WORK_DIR="$RUNNER_TEMP/modstore"
           rm -rf "$WORK_DIR"
           mkdir -p "$WORK_DIR/Payload"
+          cp -R "$APP_PATH" "$WORK_DIR/Payload/"
 
-          echo "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
-          echo "$PROV_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.mobileprovision"
+          (
+            cd "$WORK_DIR"
+            /usr/bin/ditto -c -k --sequesterRsrc --keepParent "Payload" "ModStore-Unsigned.ipa"
+          )
 
-          cp -R build/Build/Products/Release-iphoneos/ModStore.app \
-            "$WORK_DIR/Payload/"
-
-          # Delete Xcode intermediates before signing.
-          rm -rf build
-          rm -rf "$HOME/Library/Developer/Xcode/DerivedData"
-          rm -rf "$HOME/Library/Caches/Homebrew"
-
-          echo "Disk usage before zsign:"
-          df -h
-          du -sh "$RUNNER_TEMP"/* 2>/dev/null | sort -h || true
-
-          zsign \
-            -k "$RUNNER_TEMP/cert.p12" \
-            -p "$P12_PASSWORD" \
-            -m "$RUNNER_TEMP/cert.mobileprovision" \
-            -o "$WORK_DIR/ModStore-Signed.ipa" \
-            "$WORK_DIR/Payload/ModStore.app"
-
-          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/cert.mobileprovision"
-
-      - name: Upload Signed ModStore IPA
+      - name: Upload unsigned IPA
         uses: actions/upload-artifact@v4
         with:
-          name: ModStore-Signed
-          path: ${{ runner.temp }}/modstore/ModStore-Signed.ipa
+          name: ModStore-Unsigned
+          path: ${{ runner.temp }}/modstore-unsigned/ModStore-Unsigned.ipa
