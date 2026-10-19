@@ -142,6 +142,11 @@ jobs:
         with:
           skip-components: ""
 
+      - name: Restore signing tools
+         run: |
+           brew install zsign
+           command -v zsign
+
       - name: Sign ModStore IPA with RustSign Certificate
         env:
           P12_BASE64: ${{ secrets.RUSTSIGN_P12_BASE64 }}
