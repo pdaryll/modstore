@@ -42,8 +42,6 @@ jobs:
           echo "$P12_BASE64" | base64 --decode > cert.p12
           echo "$PROV_BASE64" | base64 --decode > cert.mobileprovision
 
-          mkdir -p Payload
-          cp -r build/Build/Products/Release-iphoneos/ModStore.app Payload/
           WORK_DIR="$RUNNER_TEMP/modstore"
           mkdir -p "$WORK_DIR/Payload"
           cp -R build/Build/Products/Release-iphoneos/ModStore.app \
@@ -57,8 +55,6 @@ jobs:
           zsign -k cert.p12 \
                 -p "$P12_PASSWORD" \
                 -m cert.mobileprovision \
-                -o ModStore-Signed.ipa \
-                Payload/ModStore.app
                 -o "$WORK_DIR/ModStore-Signed.ipa" \
                 "$WORK_DIR/Payload/ModStore.app"
 
@@ -66,5 +62,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ModStore-Signed
-          path: ModStore-Signed.ipa
           path: ${{ runner.temp }}/modstore/ModStore-Signed.ipa
