@@ -143,9 +143,9 @@ jobs:
           skip-components: ""
 
       - name: Restore signing tools
-         run: |
-           brew install zsign
-           command -v zsign
+        run: |
+          brew install zsign
+          command -v zsign
 
       - name: Sign ModStore IPA with RustSign Certificate
         env:
