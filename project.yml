@@ -1,0 +1,22 @@
+name: ModStore
+options:
+  bundleIdPrefix: com.daryll
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  ModStore:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: ModStore
+        CFBundleShortVersionString: "1.0.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        UIBackgroundModes:
+          - fetch
+        BGTaskSchedulerPermittedIdentifiers:
+          - com.daryll.modstore.refresh

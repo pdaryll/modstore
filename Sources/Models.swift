@@ -1,0 +1,39 @@
+import Foundation
+
+struct CatalogResponse: Codable {
+    let modStore: ModStoreMeta
+    let apps: [ModApp]
+}
+
+struct ModStoreMeta: Codable {
+    let version: String
+    let updatedAt: String
+    let sizeBytes: Int64
+    let changelog: String
+    let manifestURL: String
+}
+
+struct ModApp: Codable, Identifiable, Hashable {
+    let id: String
+    let name: String
+    let bundleIdentifier: String
+    let version: String
+    let sizeBytes: Int64
+    let updatedAt: String
+    let iconURL: String
+    let description: String
+    let changelog: String
+    let manifestURL: String
+
+    var formattedSize: String {
+        ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file)
+    }
+}
+
+enum InstallState: Equatable {
+    case notInstalled
+    case updateAvailable
+    case awaitingConfirmation
+    case downloading(progress: Double)
+    case installed
+}
