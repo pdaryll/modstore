@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-latest-large
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -15,14 +15,19 @@ jobs:
       - name: Free runner disk space
         run: |
           df -h
-          brew cleanup -s || true
           rm -rf "$HOME/Library/Developer/Xcode/DerivedData"
           rm -rf "$HOME/Library/Caches/Homebrew"
+          rm -rf "$HOME/Library/Developer/Xcode/iOS DeviceSupport"
+          rm -rf "$HOME/Library/Developer/CoreSimulator/Caches"
+          xcrun simctl delete all || true
           df -h
 
       - name: Generate Xcode Project & Compile Unsigned App
         run: |
           brew install xcodegen zsign
+          brew cleanup -s || true
+          rm -rf "$HOME/Library/Caches/Homebrew"
+          df -h
           xcodegen generate
           xcodebuild -project ModStore.xcodeproj \
             -scheme ModStore \
@@ -33,16 +38,25 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY=""
 
+      - name: Check disk usage before signing
+        run: |
+          df -h
+          du -sh "$RUNNER_TEMP"/* 2>/dev/null | sort -h | tail -20 || true
+          du -sh "$HOME/Library"/* 2>/dev/null | sort -h | tail -20 || true
+      
       - name: Sign ModStore IPA with RustSign Certificate
         env:
           P12_BASE64: ${{ secrets.RUSTSIGN_P12_BASE64 }}
           PROV_BASE64: ${{ secrets.RUSTSIGN_PROV_BASE64 }}
           P12_PASSWORD: ${{ secrets.RUSTSIGN_PASSWORD }}
         run: |
+          set -euo pipefail
+
           echo "$P12_BASE64" | base64 --decode > cert.p12
           echo "$PROV_BASE64" | base64 --decode > cert.mobileprovision
 
           WORK_DIR="$RUNNER_TEMP/modstore"
+          rm -rf "$WORK_DIR"
           mkdir -p "$WORK_DIR/Payload"
           cp -R build/Build/Products/Release-iphoneos/ModStore.app \
             "$WORK_DIR/Payload/"
@@ -51,6 +65,8 @@ jobs:
           # intermediate files before zsign creates the IPA.
           rm -rf build
           rm -rf "$HOME/Library/Developer/Xcode/DerivedData"
+          rm -rf "$HOME/Library/Caches/Homebrew"
+          df -h
 
           zsign -k cert.p12 \
                 -p "$P12_PASSWORD" \
