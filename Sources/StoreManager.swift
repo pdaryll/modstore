@@ -8,7 +8,16 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
     static let bgTaskID = "com.daryll.modstore.refresh"
 
     // Change this to your server's catalog URL
-    let catalogURL = URL(string: "https://yourserver.com/catalog.json")!
+    @Published var serverBaseURL: String = UserDefaults.standard.string(forKey: "serverBaseURL") ?? "https://store.daryll.site" {
+        didSet {
+        UserDefaults.standard.set(serverBaseURL, forKey: "serverBaseURL")
+        }
+    }
+
+    var catalogURL: URL {
+        let cleanBase = serverBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        return URL(string: "\(cleanBase)/catalog.json") ?? URL(string: "https://localhost/catalog.json")!
+    }
 
     @Published var apps: [ModApp] = []
     @Published var modStoreMeta: ModStoreMeta?

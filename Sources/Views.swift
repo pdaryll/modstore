@@ -194,6 +194,16 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             List {
+                Section("Server Configuration") {
+                    TextField("https://store.daryll.site", text: $store.serverBaseURL)
+                        .keyboardType(.URL)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    Button("Save & Reload Catalog") {
+                        Task { await store.fetchCatalog(sendNotifications: false) }
+                    }
+                }
+                
                 Section("About ModStore") {
                     HStack {
                         Text("Installed Version")
