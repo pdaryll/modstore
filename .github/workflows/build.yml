@@ -12,29 +12,50 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      # - name: Free runner disk space
+      #   run: |
+      #     set -euxo pipefail
+      #     df -h
+
+
+      #     # Remove large preinstalled SDKs and simulator data that are not
+      #     # needed for an iPhoneOS device build.
+      #     sudo rm -rf /Applications/Xcode_*.app/Contents/Developer/Platforms \
+      #       2>/dev/null || true
+
+      #     rm -rf "$HOME/Library/Developer/Xcode/DerivedData"
+      #     rm -rf "$HOME/Library/Caches/Homebrew"
+      #     rm -rf "$HOME/Library/Developer/Xcode/iOS DeviceSupport"
+      #     rm -rf "$HOME/Library/Developer/CoreSimulator/Caches"
+      #     xcrun simctl delete all || true
+
+      #     # Remove unused Homebrew downloads and caches.
+      #     brew cleanup -s || true
+      #     rm -rf "$HOME/Library/Caches/Homebrew"
+          
+      #     df -h
+
       - name: Free runner disk space
         run: |
           set -euxo pipefail
+
           df -h
-
-
-          # Remove large preinstalled SDKs and simulator data that are not
-          # needed for an iPhoneOS device build.
-          sudo rm -rf /Applications/Xcode_*.app/Contents/Developer/Platforms \
-            2>/dev/null || true
 
           rm -rf "$HOME/Library/Developer/Xcode/DerivedData"
           rm -rf "$HOME/Library/Caches/Homebrew"
           rm -rf "$HOME/Library/Developer/Xcode/iOS DeviceSupport"
           rm -rf "$HOME/Library/Developer/CoreSimulator/Caches"
+
           xcrun simctl delete all || true
-
-          # Remove unused Homebrew downloads and caches.
           brew cleanup -s || true
-          rm -rf "$HOME/Library/Caches/Homebrew"
-          
-          df -h
 
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* \
+            2>/dev/null || true
+
+          rm -rf "$HOME/Library/Caches/Homebrew"
+
+          df -h
+          
       - name: Generate Xcode Project & Compile Unsigned App
         run: |
           brew install xcodegen zsign
