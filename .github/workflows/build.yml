@@ -12,6 +12,14 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      - name: Free runner disk space
+        run: |
+          df -h
+          brew cleanup -s || true
+          rm -rf "$HOME/Library/Developer/Xcode/DerivedData"
+          rm -rf "$HOME/Library/Caches/Homebrew"
+          df -h
+
       - name: Generate Xcode Project & Compile Unsigned App
         run: |
           brew install xcodegen zsign
@@ -36,15 +44,27 @@ jobs:
 
           mkdir -p Payload
           cp -r build/Build/Products/Release-iphoneos/ModStore.app Payload/
+          WORK_DIR="$RUNNER_TEMP/modstore"
+          mkdir -p "$WORK_DIR/Payload"
+          cp -R build/Build/Products/Release-iphoneos/ModStore.app \
+            "$WORK_DIR/Payload/"
+
+          # The compiled app is now safe in RUNNER_TEMP. Remove Xcode's
+          # intermediate files before zsign creates the IPA.
+          rm -rf build
+          rm -rf "$HOME/Library/Developer/Xcode/DerivedData"
 
           zsign -k cert.p12 \
                 -p "$P12_PASSWORD" \
                 -m cert.mobileprovision \
                 -o ModStore-Signed.ipa \
                 Payload/ModStore.app
+                -o "$WORK_DIR/ModStore-Signed.ipa" \
+                "$WORK_DIR/Payload/ModStore.app"
 
       - name: Upload Signed ModStore IPA
         uses: actions/upload-artifact@v4
         with:
           name: ModStore-Signed
           path: ModStore-Signed.ipa
+          path: ${{ runner.temp }}/modstore/ModStore-Signed.ipa
