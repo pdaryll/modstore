@@ -2,7 +2,7 @@ import SwiftUI
 import UIKit
 import BackgroundTasks
 
-// MARK: - Smart Single-Line Text (Only Fades When String Actually Overflows Available Width)
+// MARK: - Lightweight Single-Pass Text (Zero Double-Layout Scroll Jank)
 struct SmartFadeText: View {
     let text: String
     var font: Font = .body
@@ -10,33 +10,12 @@ struct SmartFadeText: View {
     var alignment: Alignment = .leading
 
     var body: some View {
-        ViewThatFits(in: .horizontal) {
-            // 1. If the string fits within the available width, render sharply with NO fade mask
-            Text(text)
-                .font(font)
-                .foregroundColor(color)
-                .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: false)
-                .frame(maxWidth: .infinity, alignment: alignment)
-
-            // 2. Only if the string is unusually long and overflows, apply a subtle right-edge fade
-            Text(text)
-                .font(font)
-                .foregroundColor(color)
-                .lineLimit(1)
-                .frame(maxWidth: .infinity, alignment: alignment)
-                .mask(
-                    LinearGradient(
-                        stops: [
-                            .init(color: .black, location: 0.0),
-                            .init(color: .black, location: 0.90),
-                            .init(color: .black.opacity(0.08), location: 1.0)
-                        ],
-                        startPoint: .leading,
-                        endPoint: .trailing
-                    )
-                )
-        }
+        Text(text)
+            .font(font)
+            .foregroundColor(color)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .frame(maxWidth: .infinity, alignment: alignment)
     }
 }
 
@@ -96,16 +75,6 @@ struct ModStoreApp: App {
     @State private var hasCompletedInitialLoad = false
 
     init() {
-        let standard = UINavigationBarAppearance()
-        standard.configureWithDefaultBackground()
-        let scrollEdge = UINavigationBarAppearance()
-        scrollEdge.configureWithTransparentBackground()
-
-        UINavigationBar.appearance().standardAppearance = standard
-        UINavigationBar.appearance().compactAppearance = standard
-        UINavigationBar.appearance().scrollEdgeAppearance = scrollEdge
-        UINavigationBar.appearance().prefersLargeTitles = true
-
         BGTaskScheduler.shared.register(forTaskWithIdentifier: StoreManager.bgTaskID, using: nil) { task in
             guard let refreshTask = task as? BGAppRefreshTask else { return }
             Task { @MainActor in
@@ -127,7 +96,6 @@ struct ModStoreApp: App {
                 }
                 .onChange(of: scenePhase) { newPhase in
                     if newPhase == .active && hasCompletedInitialLoad {
-                        // Immediately re-check if any app was deleted on the Home Screen
                         store.refreshInstallStates(sendNotifications: false)
                         Task { await store.fetchCatalog(sendNotifications: false) }
                     } else if newPhase == .background {
@@ -158,7 +126,6 @@ struct MainTabView: View {
                     .tag(1)
             }
 
-            // Floating Toast Banner when an install fails or status updates
             if let banner = store.statusBanner {
                 HStack(spacing: 10) {
                     Image(systemName: banner.isError ? "exclamationmark.triangle.fill" : "info.circle.fill")
@@ -254,9 +221,6 @@ struct CatalogListView: View {
             .listStyle(.plain)
             .navigationTitle("ModStore")
             .navigationBarTitleDisplayMode(.large)
-            .onAppear {
-                store.refreshInstallStates(sendNotifications: false)
-            }
             .refreshable {
                 await store.fetchCatalog(sendNotifications: false)
             }
@@ -312,7 +276,6 @@ struct AppDetailView: View {
 
                 Divider()
 
-                // Uniform 3-Column Metadata Bar (Only fades if a value overflows its column)
                 HStack(spacing: 0) {
                     metadataColumn(title: "VERSION", value: "v\(app.version)")
                     Divider().frame(height: 32)
@@ -353,9 +316,6 @@ struct AppDetailView: View {
             .padding()
         }
         .navigationBarTitleDisplayMode(.inline)
-        .onAppear {
-            store.refreshInstallStates(sendNotifications: false)
-        }
     }
 
     private func metadataColumn(title: String, value: String) -> some View {

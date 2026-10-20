@@ -1,11 +1,11 @@
 import Foundation
 
-struct CatalogResponse: Codable {
+struct CatalogResponse: Codable, Equatable {
     let modStore: ModStoreMeta
     let apps: [ModApp]
 }
 
-struct ModStoreMeta: Codable {
+struct ModStoreMeta: Codable, Equatable {
     let version: String
     let updatedAt: String
     let sizeBytes: Int64
@@ -13,7 +13,7 @@ struct ModStoreMeta: Codable {
     let manifestURL: String
 }
 
-struct ModApp: Codable, Identifiable, Hashable {
+struct ModApp: Codable, Identifiable, Hashable, Equatable {
     let id: String
     let name: String
     let bundleIdentifier: String
