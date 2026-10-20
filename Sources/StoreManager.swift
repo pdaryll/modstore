@@ -1,6 +1,7 @@
 import SwiftUI
 import UserNotifications
 import BackgroundTasks
+import ObjectiveC.runtime
 
 @MainActor
 final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
@@ -50,9 +51,14 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
     }
 
+    private func installedKey(for bundleID: String) -> String {
+        "installed_bundle_\(bundleID)"
+    }
+
     func fetchCatalog(sendNotifications: Bool = false) async {
         do {
-            let (data, _) = try await URLSession.shared.data(from: catalogURL)
+            let request = URLRequest(url: catalogURL, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 15)
+            let (data, _) = try await URLSession.shared.data(for: request)
             let decoded = try JSONDecoder().decode(CatalogResponse.self, from: data)
             self.apps = decoded.apps
             self.modStoreMeta = decoded.modStore
@@ -79,7 +85,7 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
 
             if sendNotifications && state == .updateAvailable {
                 sendUpdateNotification(
-                    id: "update-\(app.id)-\(app.version)",
+                    id: "update-\(app.bundleIdentifier)-\(app.version)",
                     title: "Update Available",
                     body: "\(app.name) v\(app.version) is ready to install.",
                     userInfo: ["target": "app_detail", "appID": app.id]
@@ -105,28 +111,13 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
     }
 
     private func evaluateAppState(for app: ModApp) -> InstallState {
-        let savedVersion = UserDefaults.standard.string(forKey: "installed_\(app.id)")
-
-        // Check if the untouched app's native URL scheme (e.g. twitter://) responds on device
-        if !app.urlScheme.isEmpty,
-           let schemeURL = URL(string: "\(app.urlScheme)://") {
-            let isPresentOnDevice = UIApplication.shared.canOpenURL(schemeURL)
-            if !isPresentOnDevice {
-                // App is not installed (or was deleted from the Home Screen)
-                UserDefaults.standard.removeObject(forKey: "installed_\(app.id)")
-                return .notInstalled
-            }
-            if let saved = savedVersion, saved != app.version {
-                return .updateAvailable
-            }
-            return .installed
+        guard let savedVersion = UserDefaults.standard.string(forKey: installedKey(for: app.bundleIdentifier)) else {
+            return .notInstalled
         }
-
-        // Fallback if IPA has no URL scheme in its Info.plist
-        if let saved = savedVersion {
-            return saved == app.version ? .installed : .updateAvailable
+        if app.version.compare(savedVersion, options: .numeric) == .orderedDescending {
+            return .updateAvailable
         }
-        return .notInstalled
+        return .installed
     }
 
     // MARK: - Install / Cancel / Open Actions
@@ -134,7 +125,7 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
         let state = installStates[app.id] ?? .notInstalled
         switch state {
         case .installed:
-            openApp(app)
+            openAppByBundleID(app)
         case .notInstalled, .updateAvailable:
             startOTAInstall(for: app)
         default:
@@ -143,22 +134,29 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
     }
 
     func startOTAInstall(for app: ModApp) {
-        // 1. Show spinning circle while waiting for the iOS "Install / Cancel" popup
         installStates[app.id] = .awaitingConfirmation
 
-        let encodedManifest = app.manifestURL.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? app.manifestURL
-        guard let otaURL = URL(string: "itms-services://?action=download-manifest&url=\(encodedManifest)") else {
-            installStates[app.id] = evaluateAppState(for: app)
-            return
-        }
+        Task {
+            // 1. Tell the server to reset the progress state for this app first
+            if let startURL = URL(string: "\(cleanBaseURL)/start/\(app.id)") {
+                let req = URLRequest(url: startURL, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData)
+                _ = try? await URLSession.shared.data(for: req)
+            }
 
-        UIApplication.shared.open(otaURL) { [weak self] success in
-            guard let self = self else { return }
-            if !success {
-                self.installStates[app.id] = self.evaluateAppState(for: app)
+            // 2. Trigger the native iOS "would like to install" modal
+            let encodedManifest = app.manifestURL.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? app.manifestURL
+            guard let otaURL = URL(string: "itms-services://?action=download-manifest&url=\(encodedManifest)") else {
+                installStates[app.id] = evaluateAppState(for: app)
                 return
             }
-            self.startPollingServerProgress(for: app)
+
+            let opened = await UIApplication.shared.open(otaURL)
+            if !opened {
+                installStates[app.id] = evaluateAppState(for: app)
+                return
+            }
+
+            startPollingServerProgress(for: app)
         }
     }
 
@@ -167,37 +165,49 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
 
         pollTasks[app.id] = Task { @MainActor in
             guard let progressURL = URL(string: "\(cleanBaseURL)/progress/\(app.id)") else { return }
-            var waitingTicks = 0
+
+            var sawSystemAlert = false
+            var postAlertActiveTicks = 0
 
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 350_000_000) // Poll every 0.35s
+                try? await Task.sleep(nanoseconds: 400_000_000) // Poll every 0.4s
                 guard !Task.isCancelled else { break }
 
+                // Detect when the iOS "Install / Cancel" modal overlays the app (.inactive)
+                if UIApplication.shared.applicationState != .active {
+                    sawSystemAlert = true
+                }
+
                 do {
-                    let (data, _) = try await URLSession.shared.data(from: progressURL)
+                    let req = URLRequest(url: progressURL, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 5)
+                    let (data, _) = try await URLSession.shared.data(for: req)
                     let resp = try JSONDecoder().decode(ProgressResponse.self, from: data)
 
                     switch resp.status {
                     case "waiting", "idle":
-                        // Still on the iOS system popup; keep spinning circle
-                        waitingTicks += 1
                         installStates[app.id] = .awaitingConfirmation
-                        // If user tapped "Cancel" on the iOS popup, the app returns to .active and download never starts
-                        if waitingTicks > 8 && UIApplication.shared.applicationState == .active {
-                            installStates[app.id] = evaluateAppState(for: app)
-                            return
+
+                        // Only count timeout ticks AFTER the user has dismissed the system alert
+                        // Gives iOS installd ~14 seconds (35 * 0.4s) after tapping "Install" to request the .ipa
+                        if sawSystemAlert && UIApplication.shared.applicationState == .active {
+                            postAlertActiveTicks += 1
+                            if postAlertActiveTicks > 35 {
+                                // User tapped "Cancel" on the iOS modal (installd never requested the IPA)
+                                installStates[app.id] = evaluateAppState(for: app)
+                                return
+                            }
                         }
 
                     case "downloading":
-                        // User tapped "Install" on the iOS popup; show circular progress ring with stop square
-                        waitingTicks = 0
+                        // iOS installd is actively downloading the IPA: show circular ring + stop square
+                        postAlertActiveTicks = 0
                         installStates[app.id] = .downloading(progress: max(0.05, resp.progress))
 
                     case "completed":
+                        // 100% downloaded; keep ring at 100% for 4s while iOS finishes installing on Home Screen
                         installStates[app.id] = .downloading(progress: 1.0)
-                        // Wait ~3s for iOS installd to finish unpacking and verifying the signed IPA
-                        try? await Task.sleep(nanoseconds: 3_000_000_000)
-                        UserDefaults.standard.set(app.version, forKey: "installed_\(app.id)")
+                        try? await Task.sleep(nanoseconds: 4_000_000_000)
+                        UserDefaults.standard.set(app.version, forKey: installedKey(for: app.bundleIdentifier))
                         installStates[app.id] = .installed
                         return
 
@@ -209,7 +219,7 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
                         break
                     }
                 } catch {
-                    // Ignore transient network hiccups while polling
+                    // Ignore transient network errors while polling
                 }
             }
         }
@@ -222,15 +232,32 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
 
         if let cancelURL = URL(string: "\(cleanBaseURL)/cancel/\(app.id)") {
             Task {
-                _ = try? await URLSession.shared.data(from: cancelURL)
+                let req = URLRequest(url: cancelURL, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData)
+                _ = try? await URLSession.shared.data(for: req)
             }
         }
     }
 
-    func openApp(_ app: ModApp) {
-        guard !app.urlScheme.isEmpty,
-              let url = URL(string: "\(app.urlScheme)://") else { return }
-        UIApplication.shared.open(url)
+    // MARK: - Launch App Directly by Bundle ID (Zero Breadcrumbs, No URL Scheme Required)
+    func openAppByBundleID(_ app: ModApp) {
+        guard let workspaceClass = NSClassFromString("LSApplicationWorkspace") as? NSObject.Type,
+              let workspace = workspaceClass.perform(NSSelectorFromString("defaultWorkspace"))?.takeUnretainedValue() as? NSObject else {
+            return
+        }
+
+        let selector = NSSelectorFromString("openApplicationWithBundleID:")
+        guard workspace.responds(to: selector) else { return }
+
+        typealias OpenBundleIDFunc = @convention(c) (AnyObject, Selector, NSString) -> Bool
+        let imp = workspace.method(for: selector)
+        let openFunc = unsafeBitCast(imp, to: OpenBundleIDFunc.self)
+        let didLaunch = openFunc(workspace, selector, app.bundleIdentifier as NSString)
+
+        if !didLaunch {
+            // The user deleted the app from the Home Screen! Reset state back to INSTALL
+            UserDefaults.standard.removeObject(forKey: installedKey(for: app.bundleIdentifier))
+            installStates[app.id] = .notInstalled
+        }
     }
 
     func installModStoreUpdate() {
