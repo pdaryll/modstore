@@ -6,10 +6,16 @@ struct AppStoreActionButton: View {
     var onAction: () -> Void
     var onCancel: () -> Void
 
-    private let buttonWidth: CGFloat = 76
-    private let uniformHeight: CGFloat = 28
+    private let pillWidth: CGFloat = 82
+    private let height: CGFloat = 30
 
-    private var isCircular: Bool {
+    @State private var currentWidth: CGFloat = 82
+    @State private var textOpacity: Double = 1.0
+    @State private var ringVisible: Bool = false
+    @State private var displayedTitle: String = "INSTALL"
+    @State private var morphTask: Task<Void, Never>?
+
+    private var targetIsCircular: Bool {
         switch state {
         case .awaitingConfirmation, .downloading:
             return true
@@ -28,7 +34,7 @@ struct AppStoreActionButton: View {
         return 0.0
     }
 
-    private var buttonTitle: String {
+    private var stateTitle: String {
         switch state {
         case .notInstalled:
             return "INSTALL"
@@ -37,7 +43,7 @@ struct AppStoreActionButton: View {
         case .installed:
             return "OPEN"
         default:
-            return ""
+            return displayedTitle
         }
     }
 
@@ -45,102 +51,167 @@ struct AppStoreActionButton: View {
         Button(action: {
             if isDownloading {
                 onCancel()
-            } else if !isCircular {
+            } else if !targetIsCircular {
                 onAction()
             }
         }) {
             ZStack(alignment: alignment) {
-                // Fixed outer footprint so surrounding layout never shifts
+                // Fixed 82x30 layout footprint so row text never shifts
                 Color.clear
-                    .frame(width: buttonWidth, height: uniformHeight)
+                    .frame(width: pillWidth, height: height)
 
-                // Morphing container: always 28pt tall, width animates between 76pt and 28pt
+                // Morphing container: always 30pt tall, width animates 82pt <-> 30pt
                 ZStack {
-                    // Pill background
+                    // Pill background (shrinks into a 30x30 circle before fading into the ring)
                     Capsule()
-                        .fill(Color.gray.opacity(isCircular ? 0.0 : 0.16))
+                        .fill(Color.gray.opacity(ringVisible ? 0.0 : 0.16))
 
-                    // Pill text
-                    Text(buttonTitle)
+                    // Pill label
+                    Text(displayedTitle)
                         .font(.system(size: 13, weight: .bold))
                         .foregroundColor(.blue)
-                        .scaleEffect(isCircular ? 0.5 : 1.0)
-                        .opacity(isCircular ? 0.0 : 1.0)
+                        .opacity(textOpacity)
+                        .scaleEffect(textOpacity > 0.5 ? 1.0 : 0.75)
 
-                    // Single unified 28x28 ring for both loading spinner and blue progress bar
+                    // 30x30 Ring (matches 30pt pill height edge-to-edge using strokeBorder)
                     UnifiedAppStoreRing(
                         isSpinning: state == .awaitingConfirmation,
                         isDownloading: isDownloading,
                         progress: downloadProgress
                     )
-                    .frame(width: uniformHeight, height: uniformHeight)
-                    .scaleEffect(isCircular ? 1.0 : 0.5)
-                    .opacity(isCircular ? 1.0 : 0.0)
+                    .frame(width: height, height: height)
+                    .opacity(ringVisible ? 1.0 : 0.0)
+                    .scaleEffect(ringVisible ? 1.0 : 0.82)
                 }
-                .frame(width: isCircular ? uniformHeight : buttonWidth, height: uniformHeight)
+                .frame(width: currentWidth, height: height)
             }
-            .frame(width: buttonWidth, height: uniformHeight, alignment: alignment)
+            .frame(width: pillWidth, height: height, alignment: alignment)
             .contentShape(Rectangle())
-            .animation(.spring(response: 0.3, dampingFraction: 0.84), value: state)
         }
         .buttonStyle(.plain)
+        .onAppear {
+            if !targetIsCircular {
+                displayedTitle = stateTitle
+            }
+            syncImmediately(to: targetIsCircular)
+        }
+        .onChange(of: stateTitle) { newTitle in
+            if !targetIsCircular {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    displayedTitle = newTitle
+                }
+            }
+        }
+        .onChange(of: targetIsCircular) { isCirc in
+            runStagedMorph(toCircular: isCirc)
+        }
+    }
+
+    private func syncImmediately(to isCircular: Bool) {
+        morphTask?.cancel()
+        if isCircular {
+            currentWidth = height
+            textOpacity = 0.0
+            ringVisible = true
+        } else {
+            currentWidth = pillWidth
+            textOpacity = 1.0
+            ringVisible = false
+        }
+    }
+
+    private func runStagedMorph(toCircular: Bool) {
+        morphTask?.cancel()
+        morphTask = Task { @MainActor in
+            if toCircular {
+                // Stage 1: Fade out text quickly while shrinking button lengthwise (82pt -> 30pt circle)
+                withAnimation(.easeOut(duration: 0.14)) {
+                    textOpacity = 0.0
+                }
+                withAnimation(.spring(response: 0.38, dampingFraction: 0.84)) {
+                    currentWidth = height
+                }
+                try? await Task.sleep(nanoseconds: 240_000_000)
+                guard !Task.isCancelled else { return }
+
+                // Stage 2: Crossfade the 30x30 circle into the spinning ring
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    ringVisible = true
+                }
+            } else {
+                displayedTitle = stateTitle
+
+                // Stage 1: Crossfade the ring into a 30x30 solid capsule circle
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    ringVisible = false
+                }
+                try? await Task.sleep(nanoseconds: 150_000_000)
+                guard !Task.isCancelled else { return }
+
+                // Stage 2: Stretch the 30x30 circle lengthwise into the 82x30 pill button
+                withAnimation(.spring(response: 0.40, dampingFraction: 0.82)) {
+                    currentWidth = pillWidth
+                }
+                try? await Task.sleep(nanoseconds: 160_000_000)
+                guard !Task.isCancelled else { return }
+
+                // Stage 3: Fade in the new button label ("OPEN" / "INSTALL" / "UPDATE")
+                withAnimation(.easeOut(duration: 0.18)) {
+                    textOpacity = 1.0
+                }
+            }
+        }
     }
 }
 
+// Hardware-clocked 60/120fps ring that never stutters during state transitions
 private struct UnifiedAppStoreRing: View {
     let isSpinning: Bool
     let isDownloading: Bool
     let progress: Double
 
-    @State private var rotationDegrees: Double = 0
+    private let strokeWidth: CGFloat = 2.6
 
     var body: some View {
         ZStack {
-            // Grey Ring: 0.75 trimmed spinning arc when waiting -> morphs into 1.0 full track when downloading
+            // Subtle full-circle track so the 30x30 outer height is always visually consistent
             Circle()
-                .inset(by: 1.25)
-                .trim(from: 0.0, to: isDownloading ? 1.0 : 0.75)
-                .stroke(
-                    Color.gray.opacity(isDownloading ? 0.25 : 0.55),
-                    style: StrokeStyle(lineWidth: 2.5, lineCap: .round)
-                )
-                .rotationEffect(.degrees(isDownloading ? -90 : rotationDegrees))
-                .animation(.easeInOut(duration: 0.25), value: isDownloading)
+                .strokeBorder(Color.gray.opacity(isDownloading ? 0.24 : 0.14), lineWidth: strokeWidth)
 
-            // Blue Progress Arc + Stop Square (same exact 28x28 inset circle)
+            // Spinning Grey Arc (only visible while awaiting confirmation / deleting)
+            TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: !isSpinning)) { context in
+                let angle = (context.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 0.8) / 0.8) * 360.0
+                Circle()
+                    .trim(from: 0.0, to: 0.72)
+                    .stroke(
+                        Color.gray.opacity(0.65),
+                        style: StrokeStyle(lineWidth: strokeWidth, lineCap: .round)
+                    )
+                    .padding(strokeWidth / 2)
+                    .rotationEffect(.degrees(angle))
+            }
+            .opacity(isDownloading ? 0.0 : 1.0)
+            .animation(.easeInOut(duration: 0.2), value: isDownloading)
+
+            // Blue Progress Arc + Stop Square (fades in smoothly at the exact same 30x30 bounds)
             Circle()
-                .inset(by: 1.25)
                 .trim(from: 0.0, to: isDownloading ? CGFloat(max(0.05, progress)) : 0.0)
                 .stroke(
                     Color.blue,
-                    style: StrokeStyle(lineWidth: 2.5, lineCap: .round)
+                    style: StrokeStyle(lineWidth: strokeWidth, lineCap: .round)
                 )
+                .padding(strokeWidth / 2)
                 .rotationEffect(.degrees(-90))
                 .opacity(isDownloading ? 1.0 : 0.0)
-                .animation(.linear(duration: 0.2), value: progress)
-                .animation(.easeInOut(duration: 0.2), value: isDownloading)
+                .animation(.linear(duration: 0.22), value: progress)
+                .animation(.easeInOut(duration: 0.22), value: isDownloading)
 
             RoundedRectangle(cornerRadius: 2)
                 .fill(Color.blue)
-                .frame(width: 8.5, height: 8.5)
+                .frame(width: 9, height: 9)
                 .scaleEffect(isDownloading ? 1.0 : 0.4)
                 .opacity(isDownloading ? 1.0 : 0.0)
-                .animation(.spring(response: 0.25, dampingFraction: 0.8), value: isDownloading)
-        }
-        .onAppear {
-            startRotation()
-        }
-        .onChange(of: isSpinning) { spinning in
-            if spinning {
-                startRotation()
-            }
-        }
-    }
-
-    private func startRotation() {
-        rotationDegrees = 0
-        withAnimation(.linear(duration: 0.8).repeatForever(autoreverses: false)) {
-            rotationDegrees = 360
+                .animation(.spring(response: 0.28, dampingFraction: 0.8), value: isDownloading)
         }
     }
 }

@@ -2,20 +2,41 @@ import SwiftUI
 import UIKit
 import BackgroundTasks
 
-// MARK: - Reusable Right-Edge Fade Mask for Single-Line Text
-extension View {
-    func trailingFadeMask() -> some View {
-        self.mask(
-            LinearGradient(
-                stops: [
-                    .init(color: .black, location: 0.0),
-                    .init(color: .black, location: 0.85),
-                    .init(color: .black.opacity(0.15), location: 1.0)
-                ],
-                startPoint: .leading,
-                endPoint: .trailing
-            )
-        )
+// MARK: - Smart Single-Line Text (Only Fades When String Actually Overflows Available Width)
+struct SmartFadeText: View {
+    let text: String
+    var font: Font = .body
+    var color: Color = .primary
+    var alignment: Alignment = .leading
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            // 1. If the string fits within the available width, render sharply with NO fade mask
+            Text(text)
+                .font(font)
+                .foregroundColor(color)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .frame(maxWidth: .infinity, alignment: alignment)
+
+            // 2. Only if the string is unusually long and overflows, apply a subtle right-edge fade
+            Text(text)
+                .font(font)
+                .foregroundColor(color)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: alignment)
+                .mask(
+                    LinearGradient(
+                        stops: [
+                            .init(color: .black, location: 0.0),
+                            .init(color: .black, location: 0.90),
+                            .init(color: .black.opacity(0.08), location: 1.0)
+                        ],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                )
+        }
     }
 }
 
@@ -106,6 +127,8 @@ struct ModStoreApp: App {
                 }
                 .onChange(of: scenePhase) { newPhase in
                     if newPhase == .active && hasCompletedInitialLoad {
+                        // Immediately re-check if any app was deleted on the Home Screen
+                        store.refreshInstallStates(sendNotifications: false)
                         Task { await store.fetchCatalog(sendNotifications: false) }
                     } else if newPhase == .background {
                         store.scheduleBackgroundRefresh()
@@ -119,24 +142,66 @@ struct MainTabView: View {
     @EnvironmentObject var store: StoreManager
 
     var body: some View {
-        TabView(selection: $store.selectedTab) {
-            CatalogListView()
-                .tabItem {
-                    Label("Apps", systemImage: "square.stack.3d.up.fill")
-                }
-                .tag(0)
+        ZStack(alignment: .top) {
+            TabView(selection: $store.selectedTab) {
+                CatalogListView()
+                    .tabItem {
+                        Label("Apps", systemImage: "square.stack.3d.up.fill")
+                    }
+                    .tag(0)
 
-            SettingsView()
-                .tabItem {
-                    Label("Settings", systemImage: "gearshape.fill")
+                SettingsView()
+                    .tabItem {
+                        Label("Settings", systemImage: "gearshape.fill")
+                    }
+                    .badge(store.isModStoreUpdateAvailable ? "1" : nil)
+                    .tag(1)
+            }
+
+            // Floating Toast Banner when an install fails or status updates
+            if let banner = store.statusBanner {
+                HStack(spacing: 10) {
+                    Image(systemName: banner.isError ? "exclamationmark.triangle.fill" : "info.circle.fill")
+                        .foregroundColor(banner.isError ? .yellow : .blue)
+                    Text(banner.message)
+                        .font(.footnote.weight(.medium))
+                        .foregroundColor(.primary)
+                        .lineLimit(2)
                 }
-                .badge(store.isModStoreUpdateAvailable ? "1" : nil)
-                .tag(1)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .background(.ultraThinMaterial)
+                .clipShape(Capsule())
+                .shadow(color: .black.opacity(0.12), radius: 8, y: 4)
+                .padding(.top, 8)
+                .padding(.horizontal, 16)
+                .transition(.move(edge: .top).combined(with: .opacity))
+                .zIndex(999)
+            }
+        }
+        // Native Confirmation Modal before Deleting an App
+        .alert(
+            "Delete App",
+            isPresented: Binding(
+                get: { store.appPendingDeletion != nil },
+                set: { if !$0 { store.appPendingDeletion = nil } }
+            ),
+            presenting: store.appPendingDeletion
+        ) { app in
+            Button("Cancel", role: .cancel) {
+                store.appPendingDeletion = nil
+            }
+            Button("Delete", role: .destructive) {
+                store.confirmDeleteApp(app)
+                store.appPendingDeletion = nil
+            }
+        } message: { app in
+            Text("Are you sure you want to delete \(app.name)?")
         }
     }
 }
 
-// MARK: - App Catalog List (With Long-Press Blur, Haptics, Re-install & Delete)
+// MARK: - App Catalog List
 struct CatalogListView: View {
     @EnvironmentObject var store: StoreManager
     @State private var navigationPath: [ModApp] = []
@@ -157,17 +222,19 @@ struct CatalogListView: View {
                         CachedAppIcon(urlString: app.iconURL, size: 60, cornerRadius: 14)
 
                         VStack(alignment: .leading, spacing: 4) {
-                            Text(app.name)
-                                .font(.headline)
-                                .lineLimit(1)
-                                .truncationMode(.tail)
+                            SmartFadeText(
+                                text: app.name,
+                                font: .headline,
+                                color: .primary,
+                                alignment: .leading
+                            )
 
-                            Text("v\(app.version) • \(app.formattedSize) • \(app.description)")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                                .lineLimit(1)
-                                .truncationMode(.tail)
-                                .trailingFadeMask()
+                            SmartFadeText(
+                                text: "v\(app.version) • \(app.formattedSize) • \(app.description)",
+                                font: .caption,
+                                color: .secondary,
+                                alignment: .leading
+                            )
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -181,7 +248,6 @@ struct CatalogListView: View {
                     .padding(.vertical, 4)
                     .contentShape(Rectangle())
                 }
-                // Native iOS Long-Press Context Menu with Blur, Lift Animation & Haptics
                 .contextMenu {
                     if isAppInstalled {
                         Button {
@@ -191,7 +257,7 @@ struct CatalogListView: View {
                         }
 
                         Button(role: .destructive) {
-                            store.deleteInstalledApp(app)
+                            store.requestDeleteApp(app)
                         } label: {
                             Label("Delete", systemImage: "trash")
                         }
@@ -207,6 +273,9 @@ struct CatalogListView: View {
             .listStyle(.plain)
             .navigationTitle("ModStore")
             .navigationBarTitleDisplayMode(.large)
+            .onAppear {
+                store.refreshInstallStates(sendNotifications: false)
+            }
             .refreshable {
                 await store.fetchCatalog(sendNotifications: false)
             }
@@ -223,7 +292,7 @@ struct CatalogListView: View {
     }
 }
 
-// MARK: - App Store Detail Page (Uniform Faded Metadata Columns + Custom Text)
+// MARK: - App Store Detail Page
 struct AppDetailView: View {
     let app: ModApp
     @EnvironmentObject var store: StoreManager
@@ -234,17 +303,21 @@ struct AppDetailView: View {
                 HStack(spacing: 18) {
                     CachedAppIcon(urlString: app.iconURL, size: 96, cornerRadius: 22)
 
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(app.name)
-                            .font(.title2.bold())
-                            .lineLimit(1)
-                            .trailingFadeMask()
+                    VStack(alignment: .leading, spacing: 6) {
+                        SmartFadeText(
+                            text: app.name,
+                            font: .title2.bold(),
+                            color: .primary,
+                            alignment: .leading
+                        )
 
-                        Text(app.bundleIdentifier)
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                            .lineLimit(1)
-                            .trailingFadeMask()
+                        SmartFadeText(
+                            text: app.bundleIdentifier,
+                            font: .caption,
+                            color: .secondary,
+                            alignment: .leading
+                        )
+                        .padding(.bottom, 2)
 
                         AppStoreActionButton(
                             state: store.installStates[app.id] ?? .notInstalled,
@@ -258,7 +331,7 @@ struct AppDetailView: View {
 
                 Divider()
 
-                // Uniform 3-Column Metadata Bar with Trailing Fade
+                // Uniform 3-Column Metadata Bar (Only fades if a value overflows its column)
                 HStack(spacing: 0) {
                     metadataColumn(title: "VERSION", value: "v\(app.version)")
                     Divider().frame(height: 32)
@@ -270,7 +343,6 @@ struct AppDetailView: View {
 
                 Divider()
 
-                // Customizable What's New / Changelog
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
                         Text("What's New")
@@ -288,7 +360,6 @@ struct AppDetailView: View {
 
                 Divider()
 
-                // Customizable Description
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Description")
                         .font(.title3.bold())
@@ -301,6 +372,9 @@ struct AppDetailView: View {
             .padding()
         }
         .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            store.refreshInstallStates(sendNotifications: false)
+        }
     }
 
     private func metadataColumn(title: String, value: String) -> some View {
@@ -310,12 +384,13 @@ struct AppDetailView: View {
                 .foregroundColor(.secondary)
                 .lineLimit(1)
 
-            Text(value)
-                .font(.subheadline.weight(.semibold))
-                .lineLimit(1)
-                .padding(.horizontal, 6)
-                .frame(maxWidth: .infinity)
-                .trailingFadeMask()
+            SmartFadeText(
+                text: value,
+                font: .subheadline.weight(.semibold),
+                color: .primary,
+                alignment: .center
+            )
+            .padding(.horizontal, 6)
         }
         .frame(maxWidth: .infinity)
     }
@@ -395,7 +470,7 @@ struct SettingsView: View {
                                 }
                                 .font(.system(size: 13, weight: .bold))
                                 .foregroundColor(.white)
-                                .frame(width: 76, height: 28)
+                                .frame(width: 82, height: 30)
                                 .background(Color.blue)
                                 .clipShape(Capsule())
                             }
