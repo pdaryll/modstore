@@ -56,14 +56,21 @@ struct MainTabView: View {
     }
 }
 
-// MARK: - App Catalog List
+// MARK: - App Catalog List (No Right Arrow, Fixed Text Width, Smooth First-Tap Transition)
 struct CatalogListView: View {
     @EnvironmentObject var store: StoreManager
+    @State private var navigationPath: [ModApp] = []
 
     var body: some View {
-        NavigationStack(path: $store.navigationPath) {
+        NavigationStack(path: $navigationPath) {
             List(store.apps) { app in
-                NavigationLink(value: app) {
+                ZStack {
+                    // Hidden NavigationLink removes the trailing ">" chevron arrow
+                    NavigationLink(value: app) {
+                        EmptyView()
+                    }
+                    .opacity(0)
+
                     HStack(spacing: 14) {
                         AsyncImage(url: URL(string: app.iconURL)) { image in
                             image.resizable().scaledToFill()
@@ -76,12 +83,27 @@ struct CatalogListView: View {
                         VStack(alignment: .leading, spacing: 4) {
                             Text(app.name)
                                 .font(.headline)
-                            Text("v\(app.version) • \(app.formattedSize)")
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+
+                            Text("v\(app.version) • \(app.formattedSize) • \(app.description)")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                                .mask(
+                                    LinearGradient(
+                                        stops: [
+                                            .init(color: .black, location: 0.0),
+                                            .init(color: .black, location: 0.88),
+                                            .init(color: .black.opacity(0.25), location: 1.0)
+                                        ],
+                                        startPoint: .leading,
+                                        endPoint: .trailing
+                                    )
+                                )
                         }
-
-                        Spacer()
+                        .frame(maxWidth: .infinity, alignment: .leading)
 
                         AppStoreActionButton(
                             state: store.installStates[app.id] ?? .notInstalled,
@@ -92,12 +114,19 @@ struct CatalogListView: View {
                     .padding(.vertical, 4)
                 }
             }
+            .listStyle(.plain)
             .navigationTitle("ModStore")
             .refreshable {
                 await store.fetchCatalog(sendNotifications: false)
             }
             .navigationDestination(for: ModApp.self) { app in
                 AppDetailView(app: app)
+            }
+            .onChange(of: store.deepLinkApp) { targetApp in
+                if let targetApp = targetApp {
+                    navigationPath = [targetApp]
+                    store.deepLinkApp = nil
+                }
             }
         }
     }
@@ -111,7 +140,6 @@ struct AppDetailView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                // Header
                 HStack(spacing: 18) {
                     AsyncImage(url: URL(string: app.iconURL)) { image in
                         image.resizable().scaledToFill()
@@ -124,9 +152,11 @@ struct AppDetailView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Text(app.name)
                             .font(.title2.bold())
+                            .lineLimit(2)
                         Text(app.bundleIdentifier)
                             .font(.caption)
                             .foregroundColor(.secondary)
+                            .lineLimit(1)
 
                         AppStoreActionButton(
                             state: store.installStates[app.id] ?? .notInstalled,
@@ -139,7 +169,6 @@ struct AppDetailView: View {
 
                 Divider()
 
-                // Metadata Row (Version, Updated Date, Size)
                 HStack {
                     metadataColumn(title: "VERSION", value: app.version)
                     Spacer()
@@ -151,7 +180,6 @@ struct AppDetailView: View {
 
                 Divider()
 
-                // What's New / Changelog
                 VStack(alignment: .leading, spacing: 8) {
                     Text("What's New")
                         .font(.title3.bold())
@@ -162,7 +190,6 @@ struct AppDetailView: View {
 
                 Divider()
 
-                // Description
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Description")
                         .font(.title3.bold())
@@ -203,7 +230,7 @@ struct SettingsView: View {
                         Task { await store.fetchCatalog(sendNotifications: false) }
                     }
                 }
-                
+
                 Section("About ModStore") {
                     HStack {
                         Text("Installed Version")
@@ -260,8 +287,7 @@ struct SettingsView: View {
                                 }
                                 .font(.system(size: 13, weight: .bold))
                                 .foregroundColor(.white)
-                                .padding(.horizontal, 16)
-                                .padding(.vertical, 6)
+                                .frame(width: 78, height: 30)
                                 .background(Color.blue)
                                 .clipShape(Capsule())
                             }

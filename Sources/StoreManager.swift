@@ -28,7 +28,7 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
     @Published var modStoreInstallState: InstallState = .installed
 
     @Published var selectedTab: Int = 0
-    @Published var navigationPath: [ModApp] = []
+    @Published var deepLinkApp: ModApp? = nil
     private var pendingDeepLinkAppID: String?
 
     private var pollTasks: [String: Task<Void, Never>] = [:]
@@ -68,7 +68,7 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
                let targetApp = apps.first(where: { $0.id == pendingID }) {
                 pendingDeepLinkAppID = nil
                 selectedTab = 0
-                navigationPath = [targetApp]
+                deepLinkApp = targetApp
             }
         } catch {
             print("Failed to fetch catalog: \(error)")
@@ -302,7 +302,7 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
             } else if target == "app_detail", let appID = appID {
                 self.selectedTab = 0
                 if let matchingApp = self.apps.first(where: { $0.id == appID }) {
-                    self.navigationPath = [matchingApp]
+                    self.deepLinkApp = matchingApp
                 } else {
                     self.pendingDeepLinkAppID = appID
                 }
