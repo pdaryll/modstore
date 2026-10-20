@@ -42,13 +42,13 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
 
     @Published var selectedTab: Int = 0
     @Published var deepLinkApp: ModApp? = nil
-    @Published var appPendingDeletion: ModApp? = nil
     @Published var statusBanner: StatusBanner? = nil
 
     private var pendingDeepLinkAppID: String?
     private var pollTasks: [String: Task<Void, Never>] = [:]
     private var previousStates: [String: InstallState] = [:]
     private var bannerTask: Task<Void, Never>?
+    private var homeScreenMonitorTask: Task<Void, Never>?
 
     var currentModStoreVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0"
@@ -62,6 +62,7 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
     override private init() {
         super.init()
         UNUserNotificationCenter.current().delegate = self
+        startLiveHomeScreenMonitor()
     }
 
     func requestPermissions() {
@@ -72,8 +73,17 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
         "installed_bundle_\(bundleID)"
     }
 
-    private func schemeVerifiedKey(for bundleID: String) -> String {
-        "scheme_verified_\(bundleID)"
+    // Continuously syncs with the iOS Home Screen every 1.5s while ModStore is active
+    private func startLiveHomeScreenMonitor() {
+        homeScreenMonitorTask?.cancel()
+        homeScreenMonitorTask = Task { @MainActor in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                if UIApplication.shared.applicationState == .active && !apps.isEmpty {
+                    refreshInstallStates(sendNotifications: false)
+                }
+            }
+        }
     }
 
     func showBanner(_ message: String, isError: Bool = true) {
@@ -85,7 +95,7 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
         }
         bannerTask?.cancel()
         bannerTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 3_800_000_000)
+            try? await Task.sleep(nanoseconds: 3_500_000_000)
             guard !Task.isCancelled else { return }
             withAnimation(.easeOut(duration: 0.25)) {
                 statusBanner = nil
@@ -118,10 +128,12 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
             if case .downloading = installStates[app.id] { continue }
             if case .awaitingConfirmation = installStates[app.id] { continue }
 
-            let state = evaluateAppState(for: app)
-            installStates[app.id] = state
+            let newState = evaluateAppState(for: app)
+            if installStates[app.id] != newState {
+                installStates[app.id] = newState
+            }
 
-            if sendNotifications && state == .updateAvailable {
+            if sendNotifications && newState == .updateAvailable {
                 sendUpdateNotification(
                     id: "update-\(app.bundleIdentifier)-\(app.version)",
                     title: "Update Available",
@@ -148,71 +160,77 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
         }
     }
 
-    // MARK: - Automatic Home Screen Uninstall Detection
-    private func isAppStillOnHomeScreen(_ app: ModApp) -> Bool {
-        // 1. Check LSApplicationWorkspace.applicationIsInstalled: if supported by OS profile
-        if let workspaceClass = NSClassFromString("LSApplicationWorkspace") as? NSObject.Type,
-           let workspace = workspaceClass.perform(NSSelectorFromString("defaultWorkspace"))?.takeUnretainedValue() as? NSObject {
-            let selector = NSSelectorFromString("applicationIsInstalled:")
-            if workspace.responds(to: selector),
-               let selfBundle = Bundle.main.bundleIdentifier {
-                typealias IsInstalledFunc = @convention(c) (AnyObject, Selector, NSString) -> Bool
-                let imp = workspace.method(for: selector)
-                let checkFunc = unsafeBitCast(imp, to: IsInstalledFunc.self)
-                // Only trust applicationIsInstalled: if it returns true for ModStore itself
-                if checkFunc(workspace, selector, selfBundle as NSString) {
-                    return checkFunc(workspace, selector, app.bundleIdentifier as NSString)
-                }
-            }
+    // MARK: - Live Home Screen Presence Check (Checks All IPA URL Schemes + Bundle ID Fallbacks)
+    private func candidateSchemes(for app: ModApp) -> [String] {
+        var list: [String] = []
+        if let ipaSchemes = app.urlSchemes {
+            list.append(contentsOf: ipaSchemes)
+        }
+        if !app.urlScheme.isEmpty && !list.contains(app.urlScheme) {
+            list.append(app.urlScheme)
+        }
+        let bid = app.bundleIdentifier.lowercased()
+        if bid.contains("tweetie") || bid.contains("twitter") { list.append("twitter") }
+        if bid.contains("youtube") { list.append(contentsOf: ["youtube", "vnd.youtube"]) }
+        if bid.contains("instagram") { list.append("instagram") }
+        if bid.contains("spotify") { list.append("spotify") }
+        if bid.contains("reddit") { list.append("reddit") }
+        if bid.contains("discord") { list.append("discord") }
+        if bid.contains("twitch") { list.append("twitch") }
+        if bid.contains("tiktok") || bid.contains("musical") { list.append(contentsOf: ["tiktok", "snssdk1233"]) }
+        return list
+    }
+
+    /// Returns `true` if installed on Home Screen, `false` if deleted/not installed, or `nil` if the IPA has no queryable scheme
+    private func checkHomeScreenPresence(for app: ModApp) -> Bool? {
+        let whitelisted = Set((Bundle.main.infoDictionary?["LSApplicationQueriesSchemes"] as? [String] ?? []).map { $0.lowercased() })
+        let schemes = candidateSchemes(for: app)
+
+        // Find every scheme belonging to this IPA that ModStore is allowed to query
+        let queryable = schemes.filter { whitelisted.contains($0.lowercased()) }
+        guard !queryable.isEmpty else {
+            return nil
         }
 
-        // 2. Check URL Scheme via canOpenURL (if scheme is in Info.plist or previously verified)
-        let candidateScheme = resolvedURLScheme(for: app)
-        if !candidateScheme.isEmpty,
-           let schemeURL = URL(string: "\(candidateScheme)://") {
-            let queriedSchemes = (Bundle.main.infoDictionary?["LSApplicationQueriesSchemes"] as? [String] ?? []).map { $0.lowercased() }
-            let wasVerified = UserDefaults.standard.bool(forKey: schemeVerifiedKey(for: app.bundleIdentifier))
-
-            if queriedSchemes.contains(candidateScheme.lowercased()) || wasVerified {
-                let canOpen = UIApplication.shared.canOpenURL(schemeURL)
-                if canOpen {
-                    UserDefaults.standard.set(true, forKey: schemeVerifiedKey(for: app.bundleIdentifier))
-                }
-                return canOpen
-            } else if UIApplication.shared.canOpenURL(schemeURL) {
-                UserDefaults.standard.set(true, forKey: schemeVerifiedKey(for: app.bundleIdentifier))
+        for scheme in queryable {
+            if let url = URL(string: "\(scheme)://"), UIApplication.shared.canOpenURL(url) {
                 return true
             }
         }
-
-        return true
-    }
-
-    private func resolvedURLScheme(for app: ModApp) -> String {
-        if !app.urlScheme.isEmpty { return app.urlScheme }
-        let bid = app.bundleIdentifier.lowercased()
-        if bid.contains("tweetie") || bid.contains("twitter") { return "twitter" }
-        if bid.contains("youtube") { return "youtube" }
-        if bid.contains("instagram") { return "instagram" }
-        if bid.contains("spotify") { return "spotify" }
-        if bid.contains("reddit") { return "reddit" }
-        if bid.contains("discord") { return "discord" }
-        if bid.contains("twitch") { return "twitch" }
-        return ""
+        return false
     }
 
     private func evaluateAppState(for app: ModApp) -> InstallState {
-        guard let savedVersion = UserDefaults.standard.string(forKey: installedKey(for: app.bundleIdentifier)) else {
-            return .notInstalled
+        let key = installedKey(for: app.bundleIdentifier)
+        let savedVersion = UserDefaults.standard.string(forKey: key)
+
+        if let isOnHomeScreen = checkHomeScreenPresence(for: app) {
+            if !isOnHomeScreen {
+                // App is NOT on the Home Screen (never installed or user deleted it on Home Screen)
+                if savedVersion != nil {
+                    UserDefaults.standard.removeObject(forKey: key)
+                }
+                return .notInstalled
+            } else {
+                // App IS on the Home Screen right now!
+                if let saved = savedVersion {
+                    if app.version.compare(saved, options: .numeric) == .orderedDescending {
+                        return .updateAvailable
+                    }
+                    return .installed
+                } else {
+                    // App was already on Home Screen; record current version and show OPEN
+                    UserDefaults.standard.set(app.version, forKey: key)
+                    return .installed
+                }
+            }
         }
 
-        // Verify the app wasn't deleted from the Home Screen
-        if !isAppStillOnHomeScreen(app) {
-            UserDefaults.standard.removeObject(forKey: installedKey(for: app.bundleIdentifier))
+        // Fallback for IPAs without any URL scheme in Info.plist
+        guard let saved = savedVersion else {
             return .notInstalled
         }
-
-        if app.version.compare(savedVersion, options: .numeric) == .orderedDescending {
+        if app.version.compare(saved, options: .numeric) == .orderedDescending {
             return .updateAvailable
         }
         return .installed
@@ -225,7 +243,7 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
         }
     }
 
-    // MARK: - Primary Actions & Delete Flow with Spinner
+    // MARK: - Actions
     func handlePrimaryAction(for app: ModApp) {
         let state = installStates[app.id] ?? .notInstalled
         switch state {
@@ -243,48 +261,6 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
         startOTAInstall(for: app)
     }
 
-    func requestDeleteApp(_ app: ModApp) {
-        UINotificationFeedbackGenerator().notificationOccurred(.warning)
-        appPendingDeletion = app
-    }
-
-    func confirmDeleteApp(_ app: ModApp) {
-        pollTasks[app.id]?.cancel()
-        pollTasks.removeValue(forKey: app.id)
-
-        // 1. Morph button into spinning ring while deleting
-        installStates[app.id] = .awaitingConfirmation
-
-        Task { @MainActor in
-            var didSystemUninstall = false
-            if let workspaceClass = NSClassFromString("LSApplicationWorkspace") as? NSObject.Type,
-               let workspace = workspaceClass.perform(NSSelectorFromString("defaultWorkspace"))?.takeUnretainedValue() as? NSObject {
-                let selector = NSSelectorFromString("uninstallApplication:withOptions:")
-                if workspace.responds(to: selector) {
-                    typealias UninstallFunc = @convention(c) (AnyObject, Selector, NSString, AnyObject?) -> Bool
-                    let imp = workspace.method(for: selector)
-                    let uninstall = unsafeBitCast(imp, to: UninstallFunc.self)
-                    didSystemUninstall = uninstall(workspace, selector, app.bundleIdentifier as NSString, nil)
-                }
-            }
-
-            // Let the loading spinner run smoothly before morphing into INSTALL
-            try? await Task.sleep(nanoseconds: 750_000_000)
-
-            UserDefaults.standard.removeObject(forKey: installedKey(for: app.bundleIdentifier))
-            UserDefaults.standard.removeObject(forKey: schemeVerifiedKey(for: app.bundleIdentifier))
-            previousStates.removeValue(forKey: app.id)
-
-            // 2. Morph spinner into INSTALL button
-            installStates[app.id] = .notInstalled
-
-            if !didSystemUninstall {
-                showBanner("\(app.name) removed from ModStore. Remove icon on Home Screen if still present.", isError: false)
-            }
-        }
-    }
-
-    // MARK: - OTA Install with Cache-Busting & Error Notification
     func startOTAInstall(for app: ModApp) {
         if let current = installStates[app.id], current != .awaitingConfirmation {
             previousStates[app.id] = current
@@ -300,11 +276,8 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
                 _ = try? await URLSession.shared.data(for: req)
             }
 
-            // Always use cleanBaseURL so a localhost catalog.json never breaks OTA installs
             let ts = Int(Date().timeIntervalSince1970)
             let rawManifestURL = "\(cleanBaseURL)/manifests/\(app.id).plist?t=\(ts)"
-
-            // Strictly encode ':', '/', '?', '=', and '&' for itms-services query parameter
             let strictAllowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
             let encodedManifest = rawManifestURL.addingPercentEncoding(withAllowedCharacters: strictAllowed) ?? rawManifestURL
 
@@ -323,8 +296,11 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
         }
     }
 
+    // MARK: - 2-Phase Progress (0%->75% Server Download, 75%->100% iOS Home Screen Install)
     private func startPollingServerProgress(for app: ModApp) {
         pollTasks[app.id]?.cancel()
+
+        let wasAlreadyOnHomeScreen = (checkHomeScreenPresence(for: app) == true)
 
         pollTasks[app.id] = Task { @MainActor in
             guard let progressURL = URL(string: "\(cleanBaseURL)/progress/\(app.id)") else {
@@ -349,7 +325,7 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
             var consecutiveErrors = 0
 
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 300_000_000) // Poll every 0.3s
+                try? await Task.sleep(nanoseconds: 250_000_000) // Poll every 0.25s
                 guard !Task.isCancelled else { break }
 
                 do {
@@ -362,19 +338,17 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
                     case "waiting_manifest", "waiting", "idle":
                         installStates[app.id] = .awaitingConfirmation
                         waitingManifestTicks += 1
-                        // Give iOS up to 10 seconds (33 ticks) to fetch /manifests/<app>.plist
-                        if waitingManifestTicks >= 33 {
-                            revertState(for: app, errorReason: "iOS did not fetch the manifest. Make sure your server URL uses HTTPS.")
+                        if waitingManifestTicks >= 40 {
+                            revertState(for: app, errorReason: "iOS did not fetch the manifest. Check HTTPS tunnel.")
                             return
                         }
 
                     case "manifest_fetched":
-                        // Popup is currently on screen! Keep spinning until user taps Install or Cancel
                         installStates[app.id] = .awaitingConfirmation
+                        // As soon as the popup closes and ModStore becomes active again, revert after 1 tick (~0.25s) if user tapped Cancel!
                         if didReturnFromPopup {
                             postPopupTicks += 1
-                            // Wait ~2.4s (8 ticks) after popup closes; if download hasn't started, user tapped Cancel
-                            if postPopupTicks >= 8 {
+                            if postPopupTicks >= 2 {
                                 revertState(for: app)
                                 return
                             }
@@ -382,16 +356,44 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
 
                     case "downloading":
                         postPopupTicks = 0
-                        installStates[app.id] = .downloading(progress: max(0.05, resp.progress))
+                        // Phase 1: Map HTTP download progress (0.0 -> 1.0) to 5% -> 75% of the circle ring
+                        let mappedProgress = 0.05 + (min(max(resp.progress, 0.0), 1.0) * 0.70)
+                        installStates[app.id] = .downloading(progress: mappedProgress)
 
                     case "completed":
-                        installStates[app.id] = .downloading(progress: 1.0)
-                        try? await Task.sleep(nanoseconds: 3_200_000_000)
-                        UserDefaults.standard.set(app.version, forKey: installedKey(for: app.bundleIdentifier))
-                        let scheme = resolvedURLScheme(for: app)
-                        if !scheme.isEmpty, let sURL = URL(string: "\(scheme)://"), UIApplication.shared.canOpenURL(sURL) {
-                            UserDefaults.standard.set(true, forKey: schemeVerifiedKey(for: app.bundleIdentifier))
+                        // Phase 2: Server finished sending bytes; iOS installd is now unpacking & installing on Home Screen (75% -> 100%)
+                        let estimatedInstallSeconds = max(3.5, min(10.0, Double(app.sizeBytes) / 22_000_000.0))
+                        let stepInterval = 0.2
+                        let totalSteps = max(10, Int(estimatedInstallSeconds / stepInterval))
+
+                        for step in 1...totalSteps {
+                            guard !Task.isCancelled else { return }
+                            try? await Task.sleep(nanoseconds: UInt64(stepInterval * 1_000_000_000))
+                            guard !Task.isCancelled else { return }
+
+                            // If fresh install and iOS just finished registering the app on the Home Screen early, finish immediately!
+                            if !wasAlreadyOnHomeScreen, checkHomeScreenPresence(for: app) == true {
+                                break
+                            }
+
+                            let installFraction = Double(step) / Double(totalSteps)
+                            let ringProgress = 0.75 + (installFraction * 0.24)
+                            installStates[app.id] = .downloading(progress: min(0.99, ringProgress))
                         }
+
+                        // If fresh install with queryable scheme, wait up to 4 extra seconds at 99% until Home Screen icon is ready
+                        if !wasAlreadyOnHomeScreen, checkHomeScreenPresence(for: app) != nil {
+                            var extraWait = 0
+                            while checkHomeScreenPresence(for: app) == false && extraWait < 16 && !Task.isCancelled {
+                                try? await Task.sleep(nanoseconds: 250_000_000)
+                                extraWait += 1
+                            }
+                        }
+
+                        // Complete the full 100% circle and immediately morph into OPEN!
+                        installStates[app.id] = .downloading(progress: 1.0)
+                        try? await Task.sleep(nanoseconds: 120_000_000)
+                        UserDefaults.standard.set(app.version, forKey: installedKey(for: app.bundleIdentifier))
                         previousStates[app.id] = .installed
                         installStates[app.id] = .installed
                         return
@@ -419,6 +421,7 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
     }
 
     func cancelDownload(for app: ModApp) {
+        // Revert button immediately (0.0s delay)
         pollTasks[app.id]?.cancel()
         pollTasks.removeValue(forKey: app.id)
         revertState(for: app)
@@ -448,13 +451,14 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
         if !didLaunch {
             UserDefaults.standard.removeObject(forKey: installedKey(for: app.bundleIdentifier))
             installStates[app.id] = .notInstalled
-            showBanner("\(app.name) is no longer installed.", isError: true)
+            showBanner("\(app.name) is no longer installed on the Home Screen.", isError: true)
         }
     }
 
     func installModStoreUpdate() {
         guard let meta = modStoreMeta else { return }
-        let encoded = meta.manifestURL.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? meta.manifestURL
+        let strictAllowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
+        let encoded = meta.manifestURL.addingPercentEncoding(withAllowedCharacters: strictAllowed) ?? meta.manifestURL
         guard let otaURL = URL(string: "itms-services://?action=download-manifest&url=\(encoded)") else { return }
         UIApplication.shared.open(otaURL)
     }

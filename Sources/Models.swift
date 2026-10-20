@@ -19,6 +19,7 @@ struct ModApp: Codable, Identifiable, Hashable {
     let bundleIdentifier: String
     let version: String
     let urlScheme: String
+    let urlSchemes: [String]?
     let sizeBytes: Int64
     let updatedAt: String
     let iconURL: String

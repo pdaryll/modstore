@@ -251,15 +251,15 @@ struct CatalogListView: View {
                 .contextMenu {
                     if isAppInstalled {
                         Button {
+                            store.openAppByBundleID(app)
+                        } label: {
+                            Label("Open", systemImage: "arrow.up.forward.app")
+                        }
+
+                        Button {
                             store.reinstallApp(app)
                         } label: {
                             Label("Re-install", systemImage: "arrow.clockwise")
-                        }
-
-                        Button(role: .destructive) {
-                            store.requestDeleteApp(app)
-                        } label: {
-                            Label("Delete", systemImage: "trash")
                         }
                     } else {
                         Button {
