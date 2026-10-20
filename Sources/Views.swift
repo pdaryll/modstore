@@ -179,25 +179,6 @@ struct MainTabView: View {
                 .zIndex(999)
             }
         }
-        // Native Confirmation Modal before Deleting an App
-        .alert(
-            "Delete App",
-            isPresented: Binding(
-                get: { store.appPendingDeletion != nil },
-                set: { if !$0 { store.appPendingDeletion = nil } }
-            ),
-            presenting: store.appPendingDeletion
-        ) { app in
-            Button("Cancel", role: .cancel) {
-                store.appPendingDeletion = nil
-            }
-            Button("Delete", role: .destructive) {
-                store.confirmDeleteApp(app)
-                store.appPendingDeletion = nil
-            }
-        } message: { app in
-            Text("Are you sure you want to delete \(app.name)?")
-        }
     }
 }
 
