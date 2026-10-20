@@ -300,11 +300,13 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
                 _ = try? await URLSession.shared.data(for: req)
             }
 
-            // Append cache-buster timestamp so iOS installd never ignores a repeat install
+            // Always use cleanBaseURL so a localhost catalog.json never breaks OTA installs
             let ts = Int(Date().timeIntervalSince1970)
-            let sep = app.manifestURL.contains("?") ? "&" : "?"
-            let freshManifestURL = "\(app.manifestURL)\(sep)t=\(ts)"
-            let encodedManifest = freshManifestURL.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? freshManifestURL
+            let rawManifestURL = "\(cleanBaseURL)/manifests/\(app.id).plist?t=\(ts)"
+
+            // Strictly encode ':', '/', '?', '=', and '&' for itms-services query parameter
+            let strictAllowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
+            let encodedManifest = rawManifestURL.addingPercentEncoding(withAllowedCharacters: strictAllowed) ?? rawManifestURL
 
             guard let otaURL = URL(string: "itms-services://?action=download-manifest&url=\(encodedManifest)") else {
                 revertState(for: app, errorReason: "Invalid manifest URL for \(app.name).")
@@ -313,7 +315,7 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
 
             let opened = await UIApplication.shared.open(otaURL)
             if !opened {
-                revertState(for: app, errorReason: "Could not start installation for \(app.name).")
+                revertState(for: app, errorReason: "Could not launch iOS installer for \(app.name).")
                 return
             }
 
@@ -330,18 +332,25 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
                 return
             }
 
-            var sawSystemAlert = false
-            var postAlertActiveTicks = 0
-            var initialNoAlertTicks = 0
+            var didReturnFromPopup = false
+            let observer = NotificationCenter.default.addObserver(
+                forName: UIApplication.didBecomeActiveNotification,
+                object: nil,
+                queue: .main
+            ) { _ in
+                didReturnFromPopup = true
+            }
+            defer {
+                NotificationCenter.default.removeObserver(observer)
+            }
+
+            var waitingManifestTicks = 0
+            var postPopupTicks = 0
             var consecutiveErrors = 0
 
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 300_000_000) // Poll every 0.3s
                 guard !Task.isCancelled else { break }
-
-                if UIApplication.shared.applicationState != .active {
-                    sawSystemAlert = true
-                }
 
                 do {
                     let req = URLRequest(url: progressURL, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 4)
@@ -350,29 +359,29 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
                     consecutiveErrors = 0
 
                     switch resp.status {
-                    case "waiting", "idle":
+                    case "waiting_manifest", "waiting", "idle":
                         installStates[app.id] = .awaitingConfirmation
+                        waitingManifestTicks += 1
+                        // Give iOS up to 10 seconds (33 ticks) to fetch /manifests/<app>.plist
+                        if waitingManifestTicks >= 33 {
+                            revertState(for: app, errorReason: "iOS did not fetch the manifest. Make sure your server URL uses HTTPS.")
+                            return
+                        }
 
-                        if sawSystemAlert {
-                            if UIApplication.shared.applicationState == .active {
-                                postAlertActiveTicks += 1
-                                // Wait ~3.0s (10 ticks) after modal closes for iOS installd to send HEAD/GET over tunnel
-                                if postAlertActiveTicks >= 10 {
-                                    // User tapped Cancel on modal (or installd blocked the manifest)
-                                    revertState(for: app)
-                                    return
-                                }
-                            }
-                        } else {
-                            initialNoAlertTicks += 1
-                            if initialNoAlertTicks >= 14 {
-                                revertState(for: app, errorReason: "Install prompt failed to appear for \(app.name). Check HTTPS tunnel.")
+                    case "manifest_fetched":
+                        // Popup is currently on screen! Keep spinning until user taps Install or Cancel
+                        installStates[app.id] = .awaitingConfirmation
+                        if didReturnFromPopup {
+                            postPopupTicks += 1
+                            // Wait ~2.4s (8 ticks) after popup closes; if download hasn't started, user tapped Cancel
+                            if postPopupTicks >= 8 {
+                                revertState(for: app)
                                 return
                             }
                         }
 
                     case "downloading":
-                        postAlertActiveTicks = 0
+                        postPopupTicks = 0
                         installStates[app.id] = .downloading(progress: max(0.05, resp.progress))
 
                     case "completed":
