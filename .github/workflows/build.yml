@@ -123,13 +123,16 @@ jobs:
           set -euo pipefail
           IPA_FILE="$RUNNER_TEMP/modstore-unsigned/ModStore-Unsigned.ipa"
 
+          # Get time in UTC+8
+          CURRENT_TIME=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')
+
           # Create the 'latest' release if it doesn't exist yet, then overwrite the .ipa asset
           if ! gh release view latest >/dev/null 2>&1; then
             gh release create latest "$IPA_FILE" \
               --title "Latest ModStore Build" \
-              --notes "Automated unsigned IPA build from commit ${{ github.sha }}"
+              --notes "$CURRENT_TIME Automated (no latest) unsigned IPA build from commit ${{ github.sha }}"
           else
             gh release upload latest "$IPA_FILE" --clobber
             gh release edit latest \
-              --notes "Automated unsigned IPA build from commit ${{ github.sha }}"
+              --notes "$CURRENT_TIME Automated (have latest) unsigned IPA build from commit ${{ github.sha }}"
           fi
