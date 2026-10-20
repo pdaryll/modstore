@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import UserNotifications
 import BackgroundTasks
 import ObjectiveC.runtime
@@ -32,6 +33,7 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
     private var pendingDeepLinkAppID: String?
 
     private var pollTasks: [String: Task<Void, Never>] = [:]
+    private var previousStates: [String: InstallState] = [:]
 
     var currentModStoreVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0"
@@ -120,7 +122,11 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
         return .installed
     }
 
-    // MARK: - Install / Cancel / Open Actions
+    private func revertState(for app: ModApp) {
+        installStates[app.id] = previousStates[app.id] ?? evaluateAppState(for: app)
+    }
+
+    // MARK: - Install / Cancel / Reinstall / Delete Actions
     func handlePrimaryAction(for app: ModApp) {
         let state = installStates[app.id] ?? .notInstalled
         switch state {
@@ -133,26 +139,58 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
         }
     }
 
+    func reinstallApp(_ app: ModApp) {
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        startOTAInstall(for: app)
+    }
+
+    func deleteInstalledApp(_ app: ModApp) {
+        UINotificationFeedbackGenerator().notificationOccurred(.warning)
+        pollTasks[app.id]?.cancel()
+        pollTasks.removeValue(forKey: app.id)
+
+        // Attempt system workspace uninstall if permitted, and clear ModStore's installed record
+        if let workspaceClass = NSClassFromString("LSApplicationWorkspace") as? NSObject.Type,
+           let workspace = workspaceClass.perform(NSSelectorFromString("defaultWorkspace"))?.takeUnretainedValue() as? NSObject {
+            let selector = NSSelectorFromString("uninstallApplication:withOptions:")
+            if workspace.responds(to: selector) {
+                typealias UninstallFunc = @convention(c) (AnyObject, Selector, NSString, AnyObject?) -> Bool
+                let imp = workspace.method(for: selector)
+                let uninstall = unsafeBitCast(imp, to: UninstallFunc.self)
+                _ = uninstall(workspace, selector, app.bundleIdentifier as NSString, nil)
+            }
+        }
+
+        UserDefaults.standard.removeObject(forKey: installedKey(for: app.bundleIdentifier))
+        previousStates.removeValue(forKey: app.id)
+        installStates[app.id] = .notInstalled
+    }
+
     func startOTAInstall(for app: ModApp) {
+        // Remember what state the button was in so we can revert cleanly on Cancel or Error
+        if let current = installStates[app.id], current != .awaitingConfirmation {
+            previousStates[app.id] = current
+        } else {
+            previousStates[app.id] = evaluateAppState(for: app)
+        }
+
         installStates[app.id] = .awaitingConfirmation
 
         Task {
-            // 1. Tell the server to reset the progress state for this app first
             if let startURL = URL(string: "\(cleanBaseURL)/start/\(app.id)") {
-                let req = URLRequest(url: startURL, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData)
+                let req = URLRequest(url: startURL, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 5)
                 _ = try? await URLSession.shared.data(for: req)
             }
 
-            // 2. Trigger the native iOS "would like to install" modal
             let encodedManifest = app.manifestURL.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? app.manifestURL
             guard let otaURL = URL(string: "itms-services://?action=download-manifest&url=\(encodedManifest)") else {
-                installStates[app.id] = evaluateAppState(for: app)
+                revertState(for: app)
                 return
             }
 
             let opened = await UIApplication.shared.open(otaURL)
             if !opened {
-                installStates[app.id] = evaluateAppState(for: app)
+                revertState(for: app)
                 return
             }
 
@@ -164,62 +202,78 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
         pollTasks[app.id]?.cancel()
 
         pollTasks[app.id] = Task { @MainActor in
-            guard let progressURL = URL(string: "\(cleanBaseURL)/progress/\(app.id)") else { return }
+            guard let progressURL = URL(string: "\(cleanBaseURL)/progress/\(app.id)") else {
+                revertState(for: app)
+                return
+            }
 
             var sawSystemAlert = false
             var postAlertActiveTicks = 0
+            var initialNoAlertTicks = 0
+            var consecutiveErrors = 0
 
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 400_000_000) // Poll every 0.4s
+                try? await Task.sleep(nanoseconds: 300_000_000) // Poll every 0.3s
                 guard !Task.isCancelled else { break }
 
-                // Detect when the iOS "Install / Cancel" modal overlays the app (.inactive)
                 if UIApplication.shared.applicationState != .active {
                     sawSystemAlert = true
                 }
 
                 do {
-                    let req = URLRequest(url: progressURL, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 5)
+                    let req = URLRequest(url: progressURL, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 4)
                     let (data, _) = try await URLSession.shared.data(for: req)
                     let resp = try JSONDecoder().decode(ProgressResponse.self, from: data)
+                    consecutiveErrors = 0
 
                     switch resp.status {
                     case "waiting", "idle":
                         installStates[app.id] = .awaitingConfirmation
 
-                        // Only count timeout ticks AFTER the user has dismissed the system alert
-                        // Gives iOS installd ~14 seconds (35 * 0.4s) after tapping "Install" to request the .ipa
-                        if sawSystemAlert && UIApplication.shared.applicationState == .active {
-                            postAlertActiveTicks += 1
-                            if postAlertActiveTicks > 35 {
-                                // User tapped "Cancel" on the iOS modal (installd never requested the IPA)
-                                installStates[app.id] = evaluateAppState(for: app)
+                        if sawSystemAlert {
+                            // Once user taps Cancel or Install, the popup closes and app becomes .active
+                            if UIApplication.shared.applicationState == .active {
+                                postAlertActiveTicks += 1
+                                // If 4 ticks (1.2s) pass after popup closes and download hasn't started, user tapped Cancel!
+                                if postAlertActiveTicks >= 4 {
+                                    revertState(for: app)
+                                    return
+                                }
+                            }
+                        } else {
+                            // If system alert never appeared after ~3 seconds, manifest failed -> revert
+                            initialNoAlertTicks += 1
+                            if initialNoAlertTicks >= 10 {
+                                revertState(for: app)
                                 return
                             }
                         }
 
                     case "downloading":
-                        // iOS installd is actively downloading the IPA: show circular ring + stop square
                         postAlertActiveTicks = 0
                         installStates[app.id] = .downloading(progress: max(0.05, resp.progress))
 
                     case "completed":
-                        // 100% downloaded; keep ring at 100% for 4s while iOS finishes installing on Home Screen
                         installStates[app.id] = .downloading(progress: 1.0)
-                        try? await Task.sleep(nanoseconds: 4_000_000_000)
+                        try? await Task.sleep(nanoseconds: 3_500_000_000)
                         UserDefaults.standard.set(app.version, forKey: installedKey(for: app.bundleIdentifier))
+                        previousStates[app.id] = .installed
                         installStates[app.id] = .installed
                         return
 
-                    case "cancelled":
-                        installStates[app.id] = evaluateAppState(for: app)
+                    case "cancelled", "error":
+                        revertState(for: app)
                         return
 
                     default:
                         break
                     }
                 } catch {
-                    // Ignore transient network errors while polling
+                    consecutiveErrors += 1
+                    if consecutiveErrors >= 3 {
+                        revertState(for: app)
+                        return
+                    }
                 }
             }
         }
@@ -228,7 +282,7 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
     func cancelDownload(for app: ModApp) {
         pollTasks[app.id]?.cancel()
         pollTasks.removeValue(forKey: app.id)
-        installStates[app.id] = evaluateAppState(for: app)
+        revertState(for: app)
 
         if let cancelURL = URL(string: "\(cleanBaseURL)/cancel/\(app.id)") {
             Task {
@@ -238,7 +292,6 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
         }
     }
 
-    // MARK: - Launch App Directly by Bundle ID (Zero Breadcrumbs, No URL Scheme Required)
     func openAppByBundleID(_ app: ModApp) {
         guard let workspaceClass = NSClassFromString("LSApplicationWorkspace") as? NSObject.Type,
               let workspace = workspaceClass.perform(NSSelectorFromString("defaultWorkspace"))?.takeUnretainedValue() as? NSObject else {
@@ -254,7 +307,6 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
         let didLaunch = openFunc(workspace, selector, app.bundleIdentifier as NSString)
 
         if !didLaunch {
-            // The user deleted the app from the Home Screen! Reset state back to INSTALL
             UserDefaults.standard.removeObject(forKey: installedKey(for: app.bundleIdentifier))
             installStates[app.id] = .notInstalled
         }
@@ -267,7 +319,6 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
         UIApplication.shared.open(otaURL)
     }
 
-    // MARK: - Local Notifications & Tap Deep-Linking
     private func sendUpdateNotification(id: String, title: String, body: String, userInfo: [AnyHashable: Any]) {
         let content = UNMutableNotificationContent()
         content.title = title

@@ -2,7 +2,24 @@ import SwiftUI
 import UIKit
 import BackgroundTasks
 
-// MARK: - Instant In-Memory Icon Cache (Prevents Grey Box Flash on App Page)
+// MARK: - Reusable Right-Edge Fade Mask for Single-Line Text
+extension View {
+    func trailingFadeMask() -> some View {
+        self.mask(
+            LinearGradient(
+                stops: [
+                    .init(color: .black, location: 0.0),
+                    .init(color: .black, location: 0.85),
+                    .init(color: .black.opacity(0.15), location: 1.0)
+                ],
+                startPoint: .leading,
+                endPoint: .trailing
+            )
+        )
+    }
+}
+
+// MARK: - Instant In-Memory Icon Cache
 final class IconMemoryCache {
     static let shared = IconMemoryCache()
     private let cache = NSCache<NSString, UIImage>()
@@ -37,8 +54,8 @@ struct CachedAppIcon: View {
         .frame(width: size, height: size)
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
         .task(id: urlString) {
-            if IconMemoryCache.shared.image(for: urlString) != nil {
-                loadedImage = IconMemoryCache.shared.image(for: urlString)
+            if let cached = IconMemoryCache.shared.image(for: urlString) {
+                loadedImage = cached
                 return
             }
             guard let url = URL(string: urlString), !urlString.isEmpty else { return }
@@ -58,7 +75,6 @@ struct ModStoreApp: App {
     @State private var hasCompletedInitialLoad = false
 
     init() {
-        // Lock NavigationBar appearance before first frame so large title never overlaps on first scroll
         let standard = UINavigationBarAppearance()
         standard.configureWithDefaultBackground()
         let scrollEdge = UINavigationBarAppearance()
@@ -120,7 +136,7 @@ struct MainTabView: View {
     }
 }
 
-// MARK: - App Catalog List (Centered Ring, Fixed Text Width, Smooth First Scroll)
+// MARK: - App Catalog List (With Long-Press Blur, Haptics, Re-install & Delete)
 struct CatalogListView: View {
     @EnvironmentObject var store: StoreManager
     @State private var navigationPath: [ModApp] = []
@@ -128,6 +144,9 @@ struct CatalogListView: View {
     var body: some View {
         NavigationStack(path: $navigationPath) {
             List(store.apps) { app in
+                let currentState = store.installStates[app.id] ?? .notInstalled
+                let isAppInstalled = (currentState == .installed || currentState == .updateAvailable)
+
                 ZStack {
                     NavigationLink(value: app) {
                         EmptyView()
@@ -148,29 +167,41 @@ struct CatalogListView: View {
                                 .foregroundColor(.secondary)
                                 .lineLimit(1)
                                 .truncationMode(.tail)
-                                .mask(
-                                    LinearGradient(
-                                        stops: [
-                                            .init(color: .black, location: 0.0),
-                                            .init(color: .black, location: 0.88),
-                                            .init(color: .black.opacity(0.25), location: 1.0)
-                                        ],
-                                        startPoint: .leading,
-                                        endPoint: .trailing
-                                    )
-                                )
+                                .trailingFadeMask()
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
 
-                        // Centered alignment on the list view
                         AppStoreActionButton(
-                            state: store.installStates[app.id] ?? .notInstalled,
+                            state: currentState,
                             alignment: .center,
                             onAction: { store.handlePrimaryAction(for: app) },
                             onCancel: { store.cancelDownload(for: app) }
                         )
                     }
                     .padding(.vertical, 4)
+                    .contentShape(Rectangle())
+                }
+                // Native iOS Long-Press Context Menu with Blur, Lift Animation & Haptics
+                .contextMenu {
+                    if isAppInstalled {
+                        Button {
+                            store.reinstallApp(app)
+                        } label: {
+                            Label("Re-install", systemImage: "arrow.clockwise")
+                        }
+
+                        Button(role: .destructive) {
+                            store.deleteInstalledApp(app)
+                        } label: {
+                            Label("Delete", systemImage: "trash")
+                        }
+                    } else {
+                        Button {
+                            store.startOTAInstall(for: app)
+                        } label: {
+                            Label("Install", systemImage: "arrow.down.circle")
+                        }
+                    }
                 }
             }
             .listStyle(.plain)
@@ -192,7 +223,7 @@ struct CatalogListView: View {
     }
 }
 
-// MARK: - App Store Detail Page (Instant Icon + Left-Aligned Morphing Ring)
+// MARK: - App Store Detail Page (Uniform Faded Metadata Columns + Custom Text)
 struct AppDetailView: View {
     let app: ModApp
     @EnvironmentObject var store: StoreManager
@@ -206,13 +237,15 @@ struct AppDetailView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Text(app.name)
                             .font(.title2.bold())
-                            .lineLimit(2)
+                            .lineLimit(1)
+                            .trailingFadeMask()
+
                         Text(app.bundleIdentifier)
                             .font(.caption)
                             .foregroundColor(.secondary)
                             .lineLimit(1)
+                            .trailingFadeMask()
 
-                        // Leading alignment so the ring sits at the left-most edge on the App Page
                         AppStoreActionButton(
                             state: store.installStates[app.id] ?? .notInstalled,
                             alignment: .leading,
@@ -220,37 +253,49 @@ struct AppDetailView: View {
                             onCancel: { store.cancelDownload(for: app) }
                         )
                     }
-                    Spacer()
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
                 Divider()
 
-                HStack {
-                    metadataColumn(title: "VERSION", value: app.version)
-                    Spacer()
+                // Uniform 3-Column Metadata Bar with Trailing Fade
+                HStack(spacing: 0) {
+                    metadataColumn(title: "VERSION", value: "v\(app.version)")
+                    Divider().frame(height: 32)
                     metadataColumn(title: "UPDATED", value: app.updatedAt)
-                    Spacer()
+                    Divider().frame(height: 32)
                     metadataColumn(title: "SIZE", value: app.formattedSize)
                 }
-                .padding(.horizontal, 8)
+                .padding(.vertical, 2)
 
                 Divider()
 
+                // Customizable What's New / Changelog
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("What's New")
-                        .font(.title3.bold())
+                    HStack {
+                        Text("What's New")
+                            .font(.title3.bold())
+                        Spacer()
+                        Text("Version \(app.version)")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                    }
                     Text(app.changelog)
                         .font(.subheadline)
-                        .foregroundColor(.secondary)
+                        .foregroundColor(.primary.opacity(0.85))
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
                 Divider()
 
+                // Customizable Description
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Description")
                         .font(.title3.bold())
                     Text(app.description)
                         .font(.body)
+                        .foregroundColor(.primary.opacity(0.9))
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             .padding()
@@ -263,9 +308,16 @@ struct AppDetailView: View {
             Text(title)
                 .font(.caption2.bold())
                 .foregroundColor(.secondary)
+                .lineLimit(1)
+
             Text(value)
                 .font(.subheadline.weight(.semibold))
+                .lineLimit(1)
+                .padding(.horizontal, 6)
+                .frame(maxWidth: .infinity)
+                .trailingFadeMask()
         }
+        .frame(maxWidth: .infinity)
     }
 }
 
@@ -343,7 +395,7 @@ struct SettingsView: View {
                                 }
                                 .font(.system(size: 13, weight: .bold))
                                 .foregroundColor(.white)
-                                .frame(width: 78, height: 30)
+                                .frame(width: 76, height: 28)
                                 .background(Color.blue)
                                 .clipShape(Capsule())
                             }
