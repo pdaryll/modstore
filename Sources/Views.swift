@@ -1,12 +1,74 @@
 import SwiftUI
+import UIKit
 import BackgroundTasks
+
+// MARK: - Instant In-Memory Icon Cache (Prevents Grey Box Flash on App Page)
+final class IconMemoryCache {
+    static let shared = IconMemoryCache()
+    private let cache = NSCache<NSString, UIImage>()
+
+    func image(for urlString: String) -> UIImage? {
+        cache.object(forKey: urlString as NSString)
+    }
+
+    func insert(_ image: UIImage, for urlString: String) {
+        cache.setObject(image, forKey: urlString as NSString)
+    }
+}
+
+struct CachedAppIcon: View {
+    let urlString: String
+    let size: CGFloat
+    let cornerRadius: CGFloat
+
+    @State private var loadedImage: UIImage?
+
+    var body: some View {
+        Group {
+            if let img = loadedImage ?? IconMemoryCache.shared.image(for: urlString) {
+                Image(uiImage: img)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                RoundedRectangle(cornerRadius: cornerRadius)
+                    .fill(Color.gray.opacity(0.2))
+            }
+        }
+        .frame(width: size, height: size)
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
+        .task(id: urlString) {
+            if IconMemoryCache.shared.image(for: urlString) != nil {
+                loadedImage = IconMemoryCache.shared.image(for: urlString)
+                return
+            }
+            guard let url = URL(string: urlString), !urlString.isEmpty else { return }
+            if let (data, _) = try? await URLSession.shared.data(from: url),
+               let uiImg = UIImage(data: data) {
+                IconMemoryCache.shared.insert(uiImg, for: urlString)
+                loadedImage = uiImg
+            }
+        }
+    }
+}
 
 @main
 struct ModStoreApp: App {
     @StateObject private var store = StoreManager.shared
     @Environment(\.scenePhase) private var scenePhase
+    @State private var hasCompletedInitialLoad = false
 
     init() {
+        // Lock NavigationBar appearance before first frame so large title never overlaps on first scroll
+        let standard = UINavigationBarAppearance()
+        standard.configureWithDefaultBackground()
+        let scrollEdge = UINavigationBarAppearance()
+        scrollEdge.configureWithTransparentBackground()
+
+        UINavigationBar.appearance().standardAppearance = standard
+        UINavigationBar.appearance().compactAppearance = standard
+        UINavigationBar.appearance().scrollEdgeAppearance = scrollEdge
+        UINavigationBar.appearance().prefersLargeTitles = true
+
         BGTaskScheduler.shared.register(forTaskWithIdentifier: StoreManager.bgTaskID, using: nil) { task in
             guard let refreshTask = task as? BGAppRefreshTask else { return }
             Task { @MainActor in
@@ -21,11 +83,13 @@ struct ModStoreApp: App {
         WindowGroup {
             MainTabView()
                 .environmentObject(store)
-                .onAppear {
+                .task {
                     store.requestPermissions()
+                    await store.fetchCatalog(sendNotifications: false)
+                    hasCompletedInitialLoad = true
                 }
                 .onChange(of: scenePhase) { newPhase in
-                    if newPhase == .active {
+                    if newPhase == .active && hasCompletedInitialLoad {
                         Task { await store.fetchCatalog(sendNotifications: false) }
                     } else if newPhase == .background {
                         store.scheduleBackgroundRefresh()
@@ -56,7 +120,7 @@ struct MainTabView: View {
     }
 }
 
-// MARK: - App Catalog List (No Right Arrow, Fixed Text Width, Smooth First-Tap Transition)
+// MARK: - App Catalog List (Centered Ring, Fixed Text Width, Smooth First Scroll)
 struct CatalogListView: View {
     @EnvironmentObject var store: StoreManager
     @State private var navigationPath: [ModApp] = []
@@ -65,20 +129,13 @@ struct CatalogListView: View {
         NavigationStack(path: $navigationPath) {
             List(store.apps) { app in
                 ZStack {
-                    // Hidden NavigationLink removes the trailing ">" chevron arrow
                     NavigationLink(value: app) {
                         EmptyView()
                     }
                     .opacity(0)
 
                     HStack(spacing: 14) {
-                        AsyncImage(url: URL(string: app.iconURL)) { image in
-                            image.resizable().scaledToFill()
-                        } placeholder: {
-                            RoundedRectangle(cornerRadius: 14).fill(Color.gray.opacity(0.2))
-                        }
-                        .frame(width: 60, height: 60)
-                        .clipShape(RoundedRectangle(cornerRadius: 14))
+                        CachedAppIcon(urlString: app.iconURL, size: 60, cornerRadius: 14)
 
                         VStack(alignment: .leading, spacing: 4) {
                             Text(app.name)
@@ -105,8 +162,10 @@ struct CatalogListView: View {
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
 
+                        // Centered alignment on the list view
                         AppStoreActionButton(
                             state: store.installStates[app.id] ?? .notInstalled,
+                            alignment: .center,
                             onAction: { store.handlePrimaryAction(for: app) },
                             onCancel: { store.cancelDownload(for: app) }
                         )
@@ -116,6 +175,7 @@ struct CatalogListView: View {
             }
             .listStyle(.plain)
             .navigationTitle("ModStore")
+            .navigationBarTitleDisplayMode(.large)
             .refreshable {
                 await store.fetchCatalog(sendNotifications: false)
             }
@@ -132,7 +192,7 @@ struct CatalogListView: View {
     }
 }
 
-// MARK: - App Store Detail Page
+// MARK: - App Store Detail Page (Instant Icon + Left-Aligned Morphing Ring)
 struct AppDetailView: View {
     let app: ModApp
     @EnvironmentObject var store: StoreManager
@@ -141,13 +201,7 @@ struct AppDetailView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 HStack(spacing: 18) {
-                    AsyncImage(url: URL(string: app.iconURL)) { image in
-                        image.resizable().scaledToFill()
-                    } placeholder: {
-                        RoundedRectangle(cornerRadius: 22).fill(Color.gray.opacity(0.2))
-                    }
-                    .frame(width: 96, height: 96)
-                    .clipShape(RoundedRectangle(cornerRadius: 22))
+                    CachedAppIcon(urlString: app.iconURL, size: 96, cornerRadius: 22)
 
                     VStack(alignment: .leading, spacing: 8) {
                         Text(app.name)
@@ -158,8 +212,10 @@ struct AppDetailView: View {
                             .foregroundColor(.secondary)
                             .lineLimit(1)
 
+                        // Leading alignment so the ring sits at the left-most edge on the App Page
                         AppStoreActionButton(
                             state: store.installStates[app.id] ?? .notInstalled,
+                            alignment: .leading,
                             onAction: { store.handlePrimaryAction(for: app) },
                             onCancel: { store.cancelDownload(for: app) }
                         )
@@ -297,6 +353,7 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("Settings")
+            .navigationBarTitleDisplayMode(.large)
         }
     }
 }
