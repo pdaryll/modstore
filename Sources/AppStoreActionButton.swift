@@ -99,10 +99,6 @@ struct AppStoreActionButton: View {
                 displayedTitle = titleForState(newState)
             }
 
-            if wasCircular != nowCircular {
-                runStagedMorph(toCircular: nowCircular, targetTitle: titleForState(newState))
-            }
-
             if UIApplication.shared.applicationState != .active {
                 syncImmediately(to: nowCircular)
             } else if wasCircular != nowCircular {
