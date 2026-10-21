@@ -371,6 +371,33 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
         }
     }
 
+    private func beginBackgroundKeepAlive(for appID: String) {
+        endBackgroundKeepAlive(for: appID)
+        let taskID = UIApplication.shared.beginBackgroundTask(withName: "ModStoreInstall-\(appID)") { [weak self] in
+            Task { @MainActor in
+                self?.endBackgroundKeepAlive(for: appID)
+            }
+        }
+        if taskID != .invalid {
+            backgroundTasks[appID] = taskID
+        }
+    }
+
+    private func endBackgroundKeepAlive(for appID: String) {
+        if let taskID = backgroundTasks.removeValue(forKey: appID), taskID != .invalid {
+            UIApplication.shared.endBackgroundTask(taskID)
+        }
+    }
+
+    private func finishInstallSuccessfully(for app: ModApp) async {
+        setState(.downloading(progress: 1.0), for: app.id)
+        try? await Task.sleep(nanoseconds: 120_000_000)
+        UserDefaults.standard.set(app.version, forKey: installedKey(for: app.bundleIdentifier))
+        previousStates[app.id] = .installed
+        setState(.installed, for: app.id)
+        endBackgroundKeepAlive(for: app.id)
+    }
+
     private func startPollingServerProgress(for app: ModApp) {
         pollTasks[app.id]?.cancel()
         beginBackgroundKeepAlive(for: app.id)

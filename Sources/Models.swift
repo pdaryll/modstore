@@ -35,6 +35,7 @@ struct ModApp: Codable, Identifiable, Hashable, Equatable {
 struct ProgressResponse: Codable {
     let status: String
     let progress: Double
+    let completedAgo: Double?
 }
 
 enum InstallState: Equatable {
@@ -43,10 +44,4 @@ enum InstallState: Equatable {
     case awaitingConfirmation
     case downloading(progress: Double)
     case installed
-}
-
-struct ProgressResponse: Codable {
-    let status: String
-    let progress: Double
-    let completedAgo: Double?
 }
