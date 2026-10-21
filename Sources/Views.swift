@@ -149,7 +149,7 @@ struct MainTabView: View {
     }
 }
 
-// MARK: - App Catalog List
+// MARK: - App Catalog List (Zero List Re-Renders During Active Downloads)
 struct CatalogListView: View {
     @EnvironmentObject var store: StoreManager
     @State private var navigationPath: [ModApp] = []
@@ -157,66 +157,7 @@ struct CatalogListView: View {
     var body: some View {
         NavigationStack(path: $navigationPath) {
             List(store.apps) { app in
-                let currentState = store.installStates[app.id] ?? .notInstalled
-                let isAppInstalled = (currentState == .installed || currentState == .updateAvailable)
-
-                ZStack {
-                    NavigationLink(value: app) {
-                        EmptyView()
-                    }
-                    .opacity(0)
-
-                    HStack(spacing: 14) {
-                        CachedAppIcon(urlString: app.iconURL, size: 60, cornerRadius: 14)
-
-                        VStack(alignment: .leading, spacing: 4) {
-                            SmartFadeText(
-                                text: app.name,
-                                font: .headline,
-                                color: .primary,
-                                alignment: .leading
-                            )
-
-                            SmartFadeText(
-                                text: "v\(app.version) • \(app.formattedSize) • \(app.description)",
-                                font: .caption,
-                                color: .secondary,
-                                alignment: .leading
-                            )
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-
-                        AppStoreActionButton(
-                            state: currentState,
-                            alignment: .center,
-                            onAction: { store.handlePrimaryAction(for: app) },
-                            onCancel: { store.cancelDownload(for: app) }
-                        )
-                    }
-                    .padding(.vertical, 4)
-                    .contentShape(Rectangle())
-                }
-                .contextMenu {
-                    if isAppInstalled {
-                        Button {
-                            store.openAppByBundleID(app)
-                        } label: {
-                            Label("Open", systemImage: "arrow.up.forward.app")
-                        }
-
-                        Button {
-                            store.reinstallApp(app)
-                        } label: {
-                            Label("Re-install", systemImage: "arrow.clockwise")
-                        }
-                    } else {
-                        Button {
-                            store.startOTAInstall(for: app)
-                        } label: {
-                            Label("Install", systemImage: "arrow.down.circle")
-                        }
-                    }
-                }
+                AppCatalogRow(app: app, stateHolder: store.stateHolder(for: app.id))
             }
             .listStyle(.plain)
             .navigationTitle("ModStore")
@@ -225,7 +166,7 @@ struct CatalogListView: View {
                 await store.fetchCatalog(sendNotifications: false)
             }
             .navigationDestination(for: ModApp.self) { app in
-                AppDetailView(app: app)
+                AppDetailView(app: app, stateHolder: store.stateHolder(for: app.id))
             }
             .onChange(of: store.deepLinkApp) { targetApp in
                 if let targetApp = targetApp {
@@ -237,9 +178,79 @@ struct CatalogListView: View {
     }
 }
 
+private struct AppCatalogRow: View {
+    let app: ModApp
+    @ObservedObject var stateHolder: AppInstallStateHolder
+    @EnvironmentObject var store: StoreManager
+
+    var body: some View {
+        let currentState = stateHolder.state
+        let isAppInstalled = (currentState == .installed || currentState == .updateAvailable)
+
+        ZStack {
+            NavigationLink(value: app) {
+                EmptyView()
+            }
+            .opacity(0)
+
+            HStack(spacing: 14) {
+                CachedAppIcon(urlString: app.iconURL, size: 60, cornerRadius: 14)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    SmartFadeText(
+                        text: app.name,
+                        font: .headline,
+                        color: .primary,
+                        alignment: .leading
+                    )
+
+                    SmartFadeText(
+                        text: "v\(app.version) • \(app.formattedSize) • \(app.description)",
+                        font: .caption,
+                        color: .secondary,
+                        alignment: .leading
+                    )
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                AppStoreActionButton(
+                    state: currentState,
+                    alignment: .center,
+                    onAction: { store.handlePrimaryAction(for: app) },
+                    onCancel: { store.cancelDownload(for: app) }
+                )
+            }
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
+        }
+        .contextMenu {
+            if isAppInstalled {
+                Button {
+                    store.openAppByBundleID(app)
+                } label: {
+                    Label("Open", systemImage: "arrow.up.forward.app")
+                }
+
+                Button {
+                    store.reinstallApp(app)
+                } label: {
+                    Label("Re-install", systemImage: "arrow.clockwise")
+                }
+            } else {
+                Button {
+                    store.startOTAInstall(for: app)
+                } label: {
+                    Label("Install", systemImage: "arrow.down.circle")
+                }
+            }
+        }
+    }
+}
+
 // MARK: - App Store Detail Page
 struct AppDetailView: View {
     let app: ModApp
+    @ObservedObject var stateHolder: AppInstallStateHolder
     @EnvironmentObject var store: StoreManager
 
     var body: some View {
@@ -265,7 +276,7 @@ struct AppDetailView: View {
                         .padding(.bottom, 2)
 
                         AppStoreActionButton(
-                            state: store.installStates[app.id] ?? .notInstalled,
+                            state: stateHolder.state,
                             alignment: .leading,
                             onAction: { store.handlePrimaryAction(for: app) },
                             onCancel: { store.cancelDownload(for: app) }
