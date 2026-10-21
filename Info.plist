@@ -4,6 +4,8 @@
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>ModStore</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -14,5 +16,51 @@
 	<string>$(PRODUCT_NAME)</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>UILaunchScreen</key>
+	<dict/>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>fetch</string>
+	</array>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>com.daryll.modstore.refresh</string>
+	</array>
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>twitter</string>
+		<string>twitterauth</string>
+		<string>atebits</string>
+		<string>bhtwitter</string>
+		<string>neofreebird</string>
+		<string>youtube</string>
+		<string>vnd.youtube</string>
+		<string>instagram</string>
+		<string>instagram-stories</string>
+		<string>spotify</string>
+		<string>reddit</string>
+		<string>discord</string>
+		<string>twitch</string>
+		<string>tiktok</string>
+		<string>snssdk1233</string>
+		<string>snssdk1180</string>
+		<string>musically</string>
+		<string>fb</string>
+		<string>fb-messenger</string>
+		<string>tg</string>
+		<string>telegram</string>
+		<string>whatsapp</string>
+		<string>snapchat</string>
+		<string>soundcloud</string>
+		<string>apollo</string>
+		<string>filza</string>
+		<string>feather</string>
+		<string>sidestore</string>
+		<string>altstore</string>
+	</array>
 </dict>
 </plist>

@@ -62,7 +62,6 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
         super.init()
         UNUserNotificationCenter.current().delegate = self
 
-        // Re-check all Home Screen apps every time you switch back to ModStore
         NotificationCenter.default.addObserver(
             forName: UIApplication.didBecomeActiveNotification,
             object: nil,
@@ -105,7 +104,6 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
             let (data, _) = try await URLSession.shared.data(for: request)
             let decoded = try JSONDecoder().decode(CatalogResponse.self, from: data)
 
-            // Only mutate @Published arrays if changed so pull-to-refresh never stutters or snaps
             if self.apps != decoded.apps {
                 self.apps = decoded.apps
             }
@@ -162,50 +160,39 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
         }
     }
 
-    // MARK: - Direct Home Screen Presence Check (FrontBoard Bundle ID + URL Schemes)
-    private func checkViaFrontBoard(bundleID: String) -> Bool? {
-        guard let serviceClass = NSClassFromString("FBSOpenApplicationService") as? NSObject.Type else {
+    // MARK: - Native iOS Install Progress Object (LSApplicationWorkspace)
+    private func systemInstallProgress(for bundleID: String) -> Progress? {
+        guard let wsClass = NSClassFromString("LSApplicationWorkspace") as? NSObject.Type,
+              let ws = wsClass.perform(NSSelectorFromString("defaultWorkspace"))?.takeUnretainedValue() as? NSObject else {
             return nil
         }
+        let sel = NSSelectorFromString("installProgressForBundleID:makeSynchronous:")
+        guard ws.responds(to: sel) else { return nil }
 
-        let serviceObj: NSObject? = {
-            let sel1 = NSSelectorFromString("serviceWithDefaultShellEndpoint")
-            if serviceClass.responds(to: sel1),
-               let obj = serviceClass.perform(sel1)?.takeUnretainedValue() as? NSObject {
-                return obj
-            }
-            let sel2 = NSSelectorFromString("defaultService")
-            if serviceClass.responds(to: sel2),
-               let obj = serviceClass.perform(sel2)?.takeUnretainedValue() as? NSObject {
-                return obj
-            }
-            return nil
-        }()
+        typealias InstallProgFunc = @convention(c) (AnyObject, Selector, NSString, UInt8) -> AnyObject?
+        let imp = ws.method(for: sel)
+        let fn = unsafeBitCast(imp, to: InstallProgFunc.self)
+        return fn(ws, sel, bundleID as NSString, 0) as? Progress
+    }
 
-        guard let service = serviceObj else { return nil }
-        let canOpenSel = NSSelectorFromString("canOpenApplication:reason:")
-        guard service.responds(to: canOpenSel),
-              let selfBundleID = Bundle.main.bundleIdentifier else {
+    // MARK: - Home Screen Presence Detection
+    private func checkViaWorkspaceCalibratedWithSafari(bundleID: String) -> Bool? {
+        guard let wsClass = NSClassFromString("LSApplicationWorkspace") as? NSObject.Type,
+              let ws = wsClass.perform(NSSelectorFromString("defaultWorkspace"))?.takeUnretainedValue() as? NSObject else {
             return nil
         }
+        let sel = NSSelectorFromString("applicationIsInstalled:")
+        guard ws.responds(to: sel) else { return nil }
 
-        typealias CanOpenFunc = @convention(c) (AnyObject, Selector, NSString, UnsafeMutablePointer<Int>?) -> Bool
-        let imp = service.method(for: canOpenSel)
-        let fn = unsafeBitCast(imp, to: CanOpenFunc.self)
+        typealias IsInstalledFunc = @convention(c) (AnyObject, Selector, NSString) -> Bool
+        let imp = ws.method(for: sel)
+        let fn = unsafeBitCast(imp, to: IsInstalledFunc.self)
 
-        var selfReason: Int = -999
-        var fakeReason: Int = -999
-        let selfResult = fn(service, canOpenSel, selfBundleID as NSString, &selfReason)
-        let fakeResult = fn(service, canOpenSel, "com.nonexistent.modstore.missing.99999" as NSString, &fakeReason)
-
-        var targetReason: Int = -999
-        let targetResult = fn(service, canOpenSel, bundleID as NSString, &targetReason)
-
-        if selfResult != fakeResult {
-            return targetResult == selfResult
-        }
-        if selfReason != fakeReason {
-            return targetReason != fakeReason
+        // Calibrate against MobileSafari (a different app guaranteed to be installed) so selfBundleID never fools us
+        let safariInstalled = fn(ws, sel, "com.apple.mobilesafari" as NSString)
+        let fakeInstalled = fn(ws, sel, "com.nonexistent.fake.app.99999" as NSString)
+        if safariInstalled && !fakeInstalled {
+            return fn(ws, sel, bundleID as NSString)
         }
         return nil
     }
@@ -219,24 +206,34 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
             list.append(app.urlScheme)
         }
         let bid = app.bundleIdentifier.lowercased()
-        if bid.contains("tweetie") || bid.contains("twitter") { list.append("twitter") }
+        if bid.contains("tweetie") || bid.contains("twitter") {
+            list.append(contentsOf: ["twitter", "twitterauth", "atebits", "bhtwitter"])
+        }
         if bid.contains("youtube") { list.append(contentsOf: ["youtube", "vnd.youtube"]) }
-        if bid.contains("instagram") { list.append("instagram") }
+        if bid.contains("instagram") { list.append(contentsOf: ["instagram", "instagram-stories"]) }
         if bid.contains("spotify") { list.append("spotify") }
         if bid.contains("reddit") { list.append("reddit") }
         if bid.contains("discord") { list.append("discord") }
         if bid.contains("twitch") { list.append("twitch") }
-        if bid.contains("tiktok") || bid.contains("musical") { list.append(contentsOf: ["tiktok", "snssdk1233"]) }
+        if bid.contains("tiktok") || bid.contains("musical") {
+            list.append(contentsOf: ["tiktok", "snssdk1233", "snssdk1180", "musically"])
+        }
         return list
     }
 
     private func isAppInstalledOnHomeScreen(_ app: ModApp) -> Bool? {
-        // 1. Check directly by Bundle ID via FrontBoardServices
-        if let fbResult = checkViaFrontBoard(bundleID: app.bundleIdentifier) {
-            return fbResult
+        // 1. If iOS is still actively installing this bundle ID on the Home Screen, it is NOT ready to open yet
+        if let prog = systemInstallProgress(for: app.bundleIdentifier),
+           !prog.isFinished && !prog.isCancelled && prog.fractionCompleted > 0.0 && prog.fractionCompleted < 1.0 {
+            return false
         }
 
-        // 2. Check all candidate URL schemes
+        // 2. Check LSApplicationWorkspace calibrated against MobileSafari
+        if let wsResult = checkViaWorkspaceCalibratedWithSafari(bundleID: app.bundleIdentifier) {
+            return wsResult
+        }
+
+        // 3. Check URL schemes via canOpenURL (SpringBoard registers these only AFTER installation completes)
         let schemes = candidateSchemes(for: app)
         for scheme in schemes {
             if let url = URL(string: "\(scheme)://"), UIApplication.shared.canOpenURL(url) {
@@ -245,7 +242,6 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
             }
         }
 
-        // If a verified scheme previously worked or is in Info.plist, false means the app is not on the Home Screen
         let whitelisted = Set((Bundle.main.infoDictionary?["LSApplicationQueriesSchemes"] as? [String] ?? []).map { $0.lowercased() })
         let hasVerifiedScheme = UserDefaults.standard.string(forKey: "verified_scheme_\(app.bundleIdentifier)") != nil
         if hasVerifiedScheme || schemes.contains(where: { whitelisted.contains($0.lowercased()) }) {
@@ -261,13 +257,11 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
 
         if let isOnHomeScreen = isAppInstalledOnHomeScreen(app) {
             if !isOnHomeScreen {
-                // App is NOT on the Home Screen (deleted or not yet installed)
                 if savedVersion != nil {
                     UserDefaults.standard.removeObject(forKey: key)
                 }
                 return .notInstalled
             } else {
-                // App IS on the Home Screen
                 if let saved = savedVersion {
                     if app.version.compare(saved, options: .numeric) == .orderedDescending {
                         return .updateAvailable
@@ -349,7 +343,7 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
         }
     }
 
-    // MARK: - Accurate 2-Phase Progress (Waits Until App Is Actually Installed on Home Screen Before Hitting 100%)
+    // MARK: - Progress Polling (Combines Server Stream + Native iOS Install Progress + Home Screen Readiness)
     private func startPollingServerProgress(for app: ModApp) {
         pollTasks[app.id]?.cancel()
 
@@ -400,7 +394,7 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
                         installStates[app.id] = .awaitingConfirmation
                         if didReturnFromPopup {
                             postPopupTicks += 1
-                            if postPopupTicks >= 2 {
+                            if postPopupTicks >= 4 {
                                 revertState(for: app)
                                 return
                             }
@@ -408,45 +402,56 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
 
                     case "downloading":
                         postPopupTicks = 0
-                        // Phase 1: Real HTTP download maps to 5% -> 80% of the progress ring
-                        let mappedProgress = 0.05 + (min(max(resp.progress, 0.0), 1.0) * 0.75)
-                        installStates[app.id] = .downloading(progress: mappedProgress)
+                        // If iOS exposes native NSProgress for this bundle ID, blend it; otherwise map server download to 5% -> 72%
+                        if let sysProg = systemInstallProgress(for: app.bundleIdentifier), sysProg.fractionCompleted > 0.01 {
+                            installStates[app.id] = .downloading(progress: max(0.05, min(0.98, sysProg.fractionCompleted)))
+                        } else {
+                            let mappedProgress = 0.05 + (min(max(resp.progress, 0.0), 1.0) * 0.67)
+                            installStates[app.id] = .downloading(progress: mappedProgress)
+                        }
 
                     case "completed":
-                        // Phase 2: iOS is unpacking & verifying the IPA on the Home Screen (80% -> 99%)
-                        // Poll until the app is genuinely installed on the Home Screen before hitting 100%!
-                        var currentVisualProgress = 0.80
-                        let maxWaitTicks = 180 // Up to 63 seconds for large modded IPAs to finish installing on device
+                        // Server finished streaming bytes; now wait until the app is genuinely installed on the Home Screen (72% -> 99%)
+                        var currentVisualProgress = 0.72
+                        let maxWaitTicks = 240 // Up to 84 seconds for large IPA signature verification + extraction on device
+                        let minUnpackTicks = max(18, Int(Double(app.sizeBytes) / 3_500_000.0))
 
                         for tick in 1...maxWaitTicks {
                             guard !Task.isCancelled else { return }
                             try? await Task.sleep(nanoseconds: 350_000_000)
                             guard !Task.isCancelled else { return }
 
-                            if !wasAlreadyInstalled {
-                                if let installedNow = isAppInstalledOnHomeScreen(app) {
-                                    if installedNow {
-                                        // App just finished installing on the Home Screen! Break immediately to hit 100%
-                                        break
-                                    } else {
-                                        // Still installing on Home Screen; creep slowly toward 99% and keep waiting
-                                        currentVisualProgress = min(0.99, 0.80 + (Double(tick) / 45.0) * 0.19)
-                                        installStates[app.id] = .downloading(progress: currentVisualProgress)
-                                        continue
-                                    }
+                            // 1. If iOS provides live NSProgress for the install, use its exact fraction
+                            if let sysProg = systemInstallProgress(for: app.bundleIdentifier), sysProg.fractionCompleted > 0.0 {
+                                if sysProg.isFinished || sysProg.fractionCompleted >= 1.0 {
+                                    break
+                                }
+                                currentVisualProgress = max(currentVisualProgress, min(0.99, sysProg.fractionCompleted))
+                                installStates[app.id] = .downloading(progress: currentVisualProgress)
+                                continue
+                            }
+
+                            // 2. Poll Home Screen readiness: wait until isAppInstalledOnHomeScreen(app) returns true!
+                            if !wasAlreadyInstalled, let installedNow = isAppInstalledOnHomeScreen(app) {
+                                if installedNow {
+                                    // App just finished installing on the Home Screen!
+                                    break
+                                } else {
+                                    currentVisualProgress = min(0.98, 0.72 + (Double(tick) / Double(minUnpackTicks + 25)) * 0.26)
+                                    installStates[app.id] = .downloading(progress: currentVisualProgress)
+                                    continue
                                 }
                             }
 
-                            // Fallback if updating an already-installed app (estimate unpacking duration by IPA size)
-                            let estimatedTicks = max(16, Int(Double(app.sizeBytes) / 4_500_000.0))
-                            currentVisualProgress = min(0.99, 0.80 + (Double(tick) / Double(estimatedTicks)) * 0.19)
+                            // 3. Fallback when updating an already-installed app
+                            currentVisualProgress = min(0.99, 0.72 + (Double(tick) / Double(minUnpackTicks)) * 0.27)
                             installStates[app.id] = .downloading(progress: currentVisualProgress)
-                            if tick >= estimatedTicks {
+                            if tick >= minUnpackTicks && isAppInstalledOnHomeScreen(app) != false {
                                 break
                             }
                         }
 
-                        // Snap to 100% full circle and immediately transform into OPEN!
+                        // Complete full 100% circle and immediately transform into OPEN
                         installStates[app.id] = .downloading(progress: 1.0)
                         try? await Task.sleep(nanoseconds: 100_000_000)
                         UserDefaults.standard.set(app.version, forKey: installedKey(for: app.bundleIdentifier))
@@ -458,17 +463,13 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
                         revertState(for: app)
                         return
 
-                    case "error":
-                        revertState(for: app, errorReason: "Download interrupted for \(app.name). Please try again.")
-                        return
-
                     default:
                         break
                     }
                 } catch {
                     consecutiveErrors += 1
-                    if consecutiveErrors >= 4 {
-                        revertState(for: app, errorReason: "Lost connection to server while installing \(app.name).")
+                    if consecutiveErrors >= 6 {
+                        revertState(for: app)
                         return
                     }
                 }
@@ -476,12 +477,27 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
         }
     }
 
+    // MARK: - Cancel Download (Calls Native iOS NSProgress.cancel() + Aborts Server Stream)
     func cancelDownload(for app: ModApp) {
         pollTasks[app.id]?.cancel()
         pollTasks.removeValue(forKey: app.id)
-        UserDefaults.standard.removeObject(forKey: installedKey(for: app.bundleIdentifier))
+
+        // 1. Trigger native iOS install progress cancellation if exposed by LSApplicationWorkspace
+        if let sysProg = systemInstallProgress(for: app.bundleIdentifier) {
+            sysProg.cancel()
+        }
+        if let wsClass = NSClassFromString("LSApplicationWorkspace") as? NSObject.Type,
+           let ws = wsClass.perform(NSSelectorFromString("defaultWorkspace"))?.takeUnretainedValue() as? NSObject {
+            let removeSel = NSSelectorFromString("removeInstallProgressForBundleID:")
+            if ws.responds(to: removeSel) {
+                ws.perform(removeSel, with: app.bundleIdentifier as NSString)
+            }
+        }
+
+        // 2. Revert UI state immediately
         installStates[app.id] = evaluateAppState(for: app)
 
+        // 3. Tell server to abort stream immediately
         if let cancelURL = URL(string: "\(cleanBaseURL)/cancel/\(app.id)") {
             Task {
                 let req = URLRequest(url: cancelURL, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData)
@@ -506,7 +522,7 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
         if !didLaunch {
             UserDefaults.standard.removeObject(forKey: installedKey(for: app.bundleIdentifier))
             installStates[app.id] = .notInstalled
-            showBanner("\(app.name) is not installed on the Home Screen.", isError: true)
+            showBanner("\(app.name) is still installing or not on the Home Screen.", isError: true)
         }
     }
 
