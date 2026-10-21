@@ -11,6 +11,8 @@ struct StatusBanner: Identifiable, Equatable {
     let isError: Bool
 }
 
+private var backgroundTasks: [String: UIBackgroundTaskIdentifier] = [:]
+
 // Isolated per-app state object so progress ticks ONLY redraw the 30x30 button, NEVER the List or NavigationStack!
 @MainActor
 final class AppInstallStateHolder: ObservableObject {
