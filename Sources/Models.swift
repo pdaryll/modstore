@@ -44,3 +44,9 @@ enum InstallState: Equatable {
     case downloading(progress: Double)
     case installed
 }
+
+struct ProgressResponse: Codable {
+    let status: String
+    let progress: Double
+    let completedAgo: Double?
+}

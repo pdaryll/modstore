@@ -373,10 +373,16 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
 
     private func startPollingServerProgress(for app: ModApp) {
         pollTasks[app.id]?.cancel()
+        beginBackgroundKeepAlive(for: app.id)
 
         let wasAlreadyInstalled = (isAppInstalledOnHomeScreen(app) == true)
+        let estimatedUnpackSeconds = max(4.0, min(14.0, Double(app.sizeBytes) / 14_000_000.0))
 
         pollTasks[app.id] = Task { @MainActor in
+            defer {
+                endBackgroundKeepAlive(for: app.id)
+            }
+
             guard let progressURL = URL(string: "\(cleanBaseURL)/progress/\(app.id)") else {
                 revertState(for: app, errorReason: "Could not connect to server.")
                 return
@@ -387,20 +393,31 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
                 forName: UIApplication.didBecomeActiveNotification,
                 object: nil,
                 queue: .main
-            ) { _ in
+            ) { [weak self] _ in
                 didReturnFromPopup = true
+                // Re-acquire background keep-alive when returning from lock screen or Home Screen
+                Task { @MainActor in
+                    self?.beginBackgroundKeepAlive(for: app.id)
+                }
             }
             defer {
                 NotificationCenter.default.removeObserver(observer)
             }
 
-            var waitingManifestTicks = 0
-            var postPopupTicks = 0
+            let startedAt = Date()
+            var popupDismissedAt: Date? = nil
+            var localCompletedDetectedAt: Date? = nil
             var consecutiveErrors = 0
 
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 250_000_000)
                 guard !Task.isCancelled else { break }
+
+                // If this was a fresh install and the app is ALREADY on the Home Screen (e.g. finished while screen was off), complete immediately!
+                if !wasAlreadyInstalled, isAppInstalledOnHomeScreen(app) == true {
+                    await finishInstallSuccessfully(for: app)
+                    return
+                }
 
                 do {
                     let req = URLRequest(url: progressURL, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 4)
@@ -411,24 +428,24 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
                     switch resp.status {
                     case "waiting_manifest", "waiting", "idle":
                         setState(.awaitingConfirmation, for: app.id)
-                        waitingManifestTicks += 1
-                        if waitingManifestTicks >= 40 {
+                        if Date().timeIntervalSince(startedAt) > 12.0 {
                             revertState(for: app, errorReason: "iOS did not fetch the manifest. Check HTTPS tunnel.")
                             return
                         }
 
                     case "manifest_fetched":
                         setState(.awaitingConfirmation, for: app.id)
-                        if didReturnFromPopup {
-                            postPopupTicks += 1
-                            if postPopupTicks >= 4 {
+                        if didReturnFromPopup && UIApplication.shared.applicationState == .active {
+                            if popupDismissedAt == nil {
+                                popupDismissedAt = Date()
+                            } else if let dismissed = popupDismissedAt, Date().timeIntervalSince(dismissed) > 1.2 {
                                 revertState(for: app)
                                 return
                             }
                         }
 
                     case "downloading":
-                        postPopupTicks = 0
+                        popupDismissedAt = nil
                         if let sysProg = systemInstallProgress(for: app.bundleIdentifier), sysProg.fractionCompleted > 0.01 {
                             setState(.downloading(progress: max(0.05, min(0.98, sysProg.fractionCompleted))), for: app.id)
                         } else {
@@ -437,47 +454,44 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
                         }
 
                     case "completed":
-                        var currentVisualProgress = 0.72
-                        let maxWaitTicks = 240
-                        let minUnpackTicks = max(18, Int(Double(app.sizeBytes) / 3_500_000.0))
-
-                        for tick in 1...maxWaitTicks {
-                            guard !Task.isCancelled else { return }
-                            try? await Task.sleep(nanoseconds: 350_000_000)
-                            guard !Task.isCancelled else { return }
-
-                            if let sysProg = systemInstallProgress(for: app.bundleIdentifier), sysProg.fractionCompleted > 0.0 {
-                                if sysProg.isFinished || sysProg.fractionCompleted >= 1.0 {
-                                    break
-                                }
-                                currentVisualProgress = max(currentVisualProgress, min(0.99, sysProg.fractionCompleted))
-                                setState(.downloading(progress: currentVisualProgress), for: app.id)
-                                continue
-                            }
-
-                            if !wasAlreadyInstalled, let installedNow = isAppInstalledOnHomeScreen(app) {
-                                if installedNow {
-                                    break
-                                } else {
-                                    currentVisualProgress = min(0.98, 0.72 + (Double(tick) / Double(minUnpackTicks + 25)) * 0.26)
-                                    setState(.downloading(progress: currentVisualProgress), for: app.id)
-                                    continue
-                                }
-                            }
-
-                            currentVisualProgress = min(0.99, 0.72 + (Double(tick) / Double(minUnpackTicks)) * 0.27)
-                            setState(.downloading(progress: currentVisualProgress), for: app.id)
-                            if tick >= minUnpackTicks && isAppInstalledOnHomeScreen(app) != false {
-                                break
-                            }
+                        if localCompletedDetectedAt == nil {
+                            localCompletedDetectedAt = Date()
                         }
 
-                        setState(.downloading(progress: 1.0), for: app.id)
-                        try? await Task.sleep(nanoseconds: 100_000_000)
-                        UserDefaults.standard.set(app.version, forKey: installedKey(for: app.bundleIdentifier))
-                        previousStates[app.id] = .installed
-                        setState(.installed, for: app.id)
-                        return
+                        // Calculate true wall-clock elapsed time since download completed (works even if phone screen was off!)
+                        let serverElapsed = resp.completedAgo ?? 0.0
+                        let localElapsed = Date().timeIntervalSince(localCompletedDetectedAt ?? Date())
+                        let elapsedUnpackSeconds = max(serverElapsed, localElapsed)
+
+                        // 1. Check native iOS NSProgress if available
+                        if let sysProg = systemInstallProgress(for: app.bundleIdentifier), sysProg.fractionCompleted > 0.0 {
+                            if sysProg.isFinished || sysProg.fractionCompleted >= 1.0 {
+                                await finishInstallSuccessfully(for: app)
+                                return
+                            }
+                            setState(.downloading(progress: max(0.72, min(0.99, sysProg.fractionCompleted))), for: app.id)
+                            continue
+                        }
+
+                        // 2. For a fresh install with a queryable scheme, check Home Screen presence
+                        if !wasAlreadyInstalled, let installedNow = isAppInstalledOnHomeScreen(app) {
+                            if installedNow || elapsedUnpackSeconds >= (estimatedUnpackSeconds + 8.0) {
+                                await finishInstallSuccessfully(for: app)
+                                return
+                            }
+                            let fraction = min(1.0, elapsedUnpackSeconds / estimatedUnpackSeconds)
+                            setState(.downloading(progress: min(0.99, 0.72 + (fraction * 0.27))), for: app.id)
+                            continue
+                        }
+
+                        // 3. Wall-clock unpacking progress (never freezes while screen is off)
+                        if elapsedUnpackSeconds >= estimatedUnpackSeconds {
+                            await finishInstallSuccessfully(for: app)
+                            return
+                        } else {
+                            let fraction = min(1.0, elapsedUnpackSeconds / estimatedUnpackSeconds)
+                            setState(.downloading(progress: min(0.99, 0.72 + (fraction * 0.27))), for: app.id)
+                        }
 
                     case "cancelled":
                         revertState(for: app)
@@ -487,8 +501,13 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
                         break
                     }
                 } catch {
+                    // When waking from screen-off, Wi-Fi takes ~1-2s to reconnect; check Home Screen before counting errors
+                    if !wasAlreadyInstalled, isAppInstalledOnHomeScreen(app) == true {
+                        await finishInstallSuccessfully(for: app)
+                        return
+                    }
                     consecutiveErrors += 1
-                    if consecutiveErrors >= 6 {
+                    if consecutiveErrors >= 10 {
                         revertState(for: app)
                         return
                     }
@@ -501,11 +520,10 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
     func cancelDownload(for app: ModApp) {
         pollTasks[app.id]?.cancel()
         pollTasks.removeValue(forKey: app.id)
+        endBackgroundKeepAlive(for: app.id)
 
-        // 1. Revert ModStore UI state immediately
         setState(evaluateAppState(for: app), for: app.id)
 
-        // 2. Tell server to fire TCP RST + serve 22-byte Empty ZIP so installd aborts immediately
         if let cancelURL = URL(string: "\(cleanBaseURL)/cancel/\(app.id)") {
             Task {
                 let req = URLRequest(url: cancelURL, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData)
@@ -513,7 +531,6 @@ final class StoreManager: NSObject, ObservableObject, UNUserNotificationCenterDe
             }
         }
 
-        // 3. Also invoke native iOS NSProgress / InstallCoordination cancel selectors if available
         if let sysProg = systemInstallProgress(for: app.bundleIdentifier) {
             sysProg.cancel()
         }
